@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1                 # 1 GPU per job
 #SBATCH --output=logs/interp_%A_%a.out
 #SBATCH --error=logs/interp_%A_%a.err
-#SBATCH --mail-type=FAIL                # Email if job fails
+#SBATCH --mail-type=END,FAIL                # Email if job fails
 #SBATCH --mail-user=yy432@cam.ac.uk
 
 # ---- Environment ----
