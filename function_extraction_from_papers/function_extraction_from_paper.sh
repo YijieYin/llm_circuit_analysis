@@ -3,8 +3,8 @@
 #SBATCH --array=0-7                  # 8 jobs (chunks 0..7) — one per A100
 #SBATCH --partition=ml               # GPU partition
 #SBATCH --gres=gpu:1                 # 1 GPU per job
-#SBATCH --output=logs/extract_%A_%a.out
-#SBATCH --error=logs/extract_%A_%a.err
+#SBATCH --output=function_extraction_from_paper/logs/extract_%A_%a.out
+#SBATCH --error=function_extraction_from_paper/logs/extract_%A_%a.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=yy432@cam.ac.uk
 
@@ -22,15 +22,15 @@ conda activate llm
 N_CHUNKS=8                           # Must match --array upper bound + 1
 CHUNK_ID=$SLURM_ARRAY_TASK_ID
 
-EXTRACT_SCRIPT="$HOME/llm_circuit_analysis/function_extraction_from_paper.py"
+EXTRACT_SCRIPT="$HOME/llm_circuit_analysis/function_extraction_from_paper/function_extraction_from_paper.py"
 
-PAPERS_CSV="$HOME/llm_circuit_analysis/extraction_results/papers_with_names.csv"
+PAPERS_CSV="$HOME/llm_circuit_analysis/function_extraction_from_paper/extraction_results/papers_with_names.csv"
 PAPERS_DIR="/cephfs2/yyin/llm_circuit_analysis/pdfs" # will be used in combination with file_name in PAPERS_CSV to locate each PDF
 GGUF="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q6_K_L.gguf"
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
-OUTPUT_DIR="$HOME/llm_circuit_analysis/extraction_results/results"
+OUTPUT_DIR="$HOME/llm_circuit_analysis/function_extraction_from_paper/extraction_results/results"
 
-mkdir -p "$HOME/llm_circuit_analysis/logs"
+mkdir -p "$HOME/llm_circuit_analysis/function_extraction_from_paper/logs"
 mkdir -p "$OUTPUT_DIR"
 
 echo "=============================="
