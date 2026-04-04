@@ -391,7 +391,7 @@ the problem this circuit likely solves.
 Respond with a JSON object containing:
 
 {{
-  "intermediate_computations": "For each key intermediate: What functional operation does it perform? How do its inputs (sensory + characterized) combine to create a specific transformation? Why might this circuit route signals through these intermediates rather than directly?",
+  "intermediate_computations": "In a single string altogether (NOT as a nested JSON object): for every key intermediate: What functional operation does it perform? How do its inputs (sensory + characterized) combine to create a specific transformation? Why might this circuit route signals through these intermediates rather than directly?",
 
   "circuit_logic": "Describe the complete information flow: Which inputs are integrated? How do excitatory and inhibitory pathways work together to enable the computation? What does the overall routing suggest about selective combination, gating, modulation, or comparison of inputs?",
 
@@ -404,7 +404,20 @@ Respond with a JSON object containing:
   "coherence_assessment": "How well do all the inputs (sensory, characterized, via intermediates) fit together into a single coherent function? Are there unexplained features? Does every major input category contribute meaningfully to the hypothesis?",
 
   "key_supporting_connections": "Which connectivity patterns most strongly support your main hypothesis?"
-}}"""
+}}
+
+If you feel not enough information is available to generate a grounded hypothesis, then say exactly "insufficient_info" in the corresponding fields. 
+
+STRICT FORMAT RULES — VIOLATIONS WILL CAUSE REJECTION AND RETRY:
+- Return EXACTLY one JSON object. No markdown, no code fences, no prose before or after.
+- The object must contain EXACTLY these 7 keys and NO others:
+  "intermediate_computations", "circuit_logic", "inferred_computation",
+  "behavioral_context", "confidence", "coherence_assessment", "key_supporting_connections"
+- Do NOT add any extra keys (no "note", "output_summary", "error_handling", etc.).
+- All values must be plain strings. No nested objects, no arrays.
+- Do not nest JSON inside JSON.
+- If insufficient information is available, write "insufficient_info" as the string value.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +509,8 @@ def calculate_circuit_connectivity(dn_type, n_steps, add_function=True):
     difference_sensdn = esensdn_sum.subtract(isensdn_sum, fill_value=0)
     if add_function:
         difference_sensdn.index = difference_sensdn.index.map(cell_type_to_function)
+    else: 
+        difference_sensdn.index = difference_sensdn.index.map(cell_type_to_random_name)
 
     # Circuit within n steps
     circuit = el_within_n_steps(
@@ -509,6 +524,8 @@ def calculate_circuit_connectivity(dn_type, n_steps, add_function=True):
     intermediate_dn = circuit[(circuit.post == dn_type) & (circuit.pre != dn_type)].copy()
     intermediate_dn["pre_sign"] = intermediate_dn.pre.map(type_to_sign)
     intermediate_dn["weight"] = intermediate_dn.weight * intermediate_dn.pre_sign
+    if not add_function:
+        intermediate_dn["pre"] = intermediate_dn.pre.map(cell_type_to_random_name)
     intermediate_dn = intermediate_dn.set_index("pre")["weight"]
 
     # Known → intermediates upstream of DN
@@ -523,6 +540,8 @@ def calculate_circuit_connectivity(dn_type, n_steps, add_function=True):
     difference_kunk = ekunk_sum.subtract(ikunk_sum, fill_value=0)
     if add_function:
         difference_kunk.index = difference_kunk.index.map(cell_type_to_function)
+    else:
+        difference_kunk.index = difference_kunk.index.map(cell_type_to_random_name)
 
     # Known → DN
     ekdn, ikdn = signed_conn_by_path_length_data(
@@ -536,6 +555,8 @@ def calculate_circuit_connectivity(dn_type, n_steps, add_function=True):
     difference_kdn = ekdn_sum.subtract(ikdn_sum, fill_value=0)
     if add_function:
         difference_kdn.index = difference_kdn.index.map(cell_type_to_function)
+    else:
+        difference_kdn.index = difference_kdn.index.map(cell_type_to_random_name)
 
     # DN → known
     ednk, idnk = signed_conn_by_path_length_data(
@@ -549,6 +570,8 @@ def calculate_circuit_connectivity(dn_type, n_steps, add_function=True):
     difference_dnk = ednk_sum.subtract(idnk_sum, fill_value=0).T
     if add_function:
         difference_dnk.index = difference_dnk.index.map(cell_type_to_function)
+    else: 
+        difference_dnk.index = difference_dnk.index.map(cell_type_to_random_name)
 
     return difference_sensdn, intermediate_dn, difference_kunk, difference_kdn, difference_dnk
 
@@ -687,10 +710,28 @@ def parse_llm_response(text):
 
     return {"error": "JSON parse failed", "raw_response": text}
 
+REQUIRED_KEYS = {
+    "intermediate_computations", "circuit_logic", "inferred_computation",
+    "behavioral_context", "confidence", "coherence_assessment",
+    "key_supporting_connections",
+}
+
+def validate_response(parsed: dict) -> tuple[bool, str]:
+    """Check parsed dict has exactly the required keys. Returns (ok, reason)."""
+    if "error" in parsed and "inferred_computation" not in parsed:
+        return False, f"parse error: {parsed.get('error')}"
+    missing = REQUIRED_KEYS - parsed.keys()
+    extra = parsed.keys() - REQUIRED_KEYS - {"cell_type", "model", "provider", "add_function", "chunk_id"}
+    if missing:
+        return False, f"missing keys: {missing}"
+    if extra:
+        return False, f"extra keys present: {extra}"
+    return True, ""
 
 # ---------------------------------------------------------------------------
 # Per-cell processing
 # ---------------------------------------------------------------------------
+MAX_RETRIES = 3
 
 def process_cell(cell_type, args, llama_port=None):
     # Circuit computation
@@ -718,27 +759,40 @@ def process_cell(cell_type, args, llama_port=None):
     verbosity = config.get("verbosity", args.verbosity)
     temperature = config.get("temperature", None)
 
-    # LLM call
-    response_text, _ = call_llm(
-        SYSTEM_PROMPT, user_prompt,
-        provider=args.provider,
-        model_name=args.model,
-        max_tokens=args.max_tokens,
-        llama_port=llama_port,
-        thinking_budget=args.thinking_budget,
-        reasoning_effort=reasoning_effort,
-        verbosity=verbosity,
-        temperature=temperature,
-    )
+    last_result = None
+    for attempt in range(MAX_RETRIES):
+        response_text, _ = call_llm(
+            SYSTEM_PROMPT, user_prompt,
+            provider=args.provider,
+            model_name=args.model,
+            max_tokens=args.max_tokens,
+            llama_port=llama_port,
+            thinking_budget=args.thinking_budget,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
+            temperature=temperature,
+        )
+        result = parse_llm_response(response_text)
+        ok, reason = validate_response(result)
+        if ok:
+            break
+        print(f"  [retry {attempt+1}/{MAX_RETRIES}] {cell_type}: {reason}")
+        last_result = result
+    else:
+        # All retries failed — keep whatever was parsed but flag it
+        result = last_result or result
+        result["validation_error"] = reason
 
-    result = parse_llm_response(response_text)
-
-    result["cell_type"] = cell_type
-    result["model"] = args.model
-    result["provider"] = args.provider
-    result["add_function"] = args.add_function
-    result["chunk_id"] = args.chunk_id
-    return result
+    # Strip any extra keys before saving
+    cleaned = {k: result[k] for k in REQUIRED_KEYS if k in result}
+    cleaned["cell_type"] = cell_type
+    cleaned["model"] = args.model
+    cleaned["provider"] = args.provider
+    cleaned["add_function"] = args.add_function
+    cleaned["chunk_id"] = args.chunk_id
+    if "validation_error" in result:
+        cleaned["validation_error"] = result["validation_error"]
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +811,7 @@ def main():
     print("Loading connectome data...")
     base_path = args.base_path
 
-    global inprop, meta, cell_type_to_function, type_to_sign, idx_to_type
+    global inprop, meta, cell_type_to_function, type_to_sign, idx_to_type, cell_type_to_random_name
 
     cell_type_to_function_df = pd.read_csv(os.path.expanduser(args.known_types_csv))
     cell_type_to_function = dict(
@@ -787,6 +841,8 @@ def main():
     )
     meta["known_function"] = meta["known_function"].fillna(meta.cell_type)
     cell_type_to_function = dict(zip(meta.cell_type, meta.known_function))
+    random_names = [f"cell_type_{i}" for i in range(len(set(meta.cell_type[~meta.cell_type.str.isdigit()])))]
+    cell_type_to_random_name = dict(zip(meta.cell_type[~meta.cell_type.str.isdigit()].unique(), random_names))
 
     # ---- Build dns list ----
     known_types = set(

@@ -3,8 +3,8 @@
 #SBATCH --array=0-7                  # 8 jobs (chunks 0,1,2,3,4,5,6,7) — one per A100
 #SBATCH --partition=ml               # GPU partition
 #SBATCH --gres=gpu:1                 # 1 GPU per job
-#SBATCH --output=logs/interp_%A_%a.out
-#SBATCH --error=logs/interp_%A_%a.err
+#SBATCH --output=logs/interp_fun_%A_%a.out
+#SBATCH --error=logs/interp_fun_%A_%a.err
 #SBATCH --mail-type=END,FAIL                # Email if job fails
 #SBATCH --mail-user=yy432@cam.ac.uk
 
@@ -23,14 +23,14 @@ conda activate llm
 N_CHUNKS=8                           # Must match --array upper bound + 1
 CHUNK_ID=$SLURM_ARRAY_TASK_ID
 
-INTERPRET_SCRIPT="$HOME/llm_circuit_analysis/neuron_interpretation.py"
+INTERPRET_SCRIPT="$HOME/llm_circuit_analysis/neuron_interpretation/neuron_interpretation.py"
 
 # Update these paths for your HPC setup:
 BASE_PATH="$HOME/interpret_connectome/"
 KNOWN_TYPES_CSV="$HOME/known_types_snapshots/known_types_140326.csv"
 GGUF="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q6_K_L.gguf"
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
-OUTPUT_DIR="$HOME/llm_circuit_analysis/results"
+OUTPUT_DIR="$HOME/llm_circuit_analysis/neuron_interpretation/results"
 
 mkdir -p "$HOME/llm_circuit_analysis/logs"
 mkdir -p "$OUTPUT_DIR"
@@ -54,9 +54,9 @@ python "$INTERPRET_SCRIPT" \
     --output-dir "$OUTPUT_DIR" \
     --n-steps 4 \
     --top-n 15 \
-    --max-tokens 20000 
-    # --no-resume \
-    # --no-add-function # whether to map cell types to known functions
+    --max-tokens 20000 \
+    --no-resume \
+    --no-add-function # whether to map cell types to known functions
 
 echo "Chunk $CHUNK_ID complete."
 

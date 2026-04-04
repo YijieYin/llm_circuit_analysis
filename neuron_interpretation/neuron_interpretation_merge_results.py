@@ -1,9 +1,9 @@
 """
-merge_results.py — Merge chunk JSONL outputs into a single file/dataframe.
+neuron_interpretation_merge_results.py — Merge chunk JSONL outputs into a single file/dataframe.
 
 Usage:
-    python merge_results.py --results-dir ./results --output hypotheses.jsonl
-    python merge_results.py --results-dir ./results --output hypotheses.csv
+    python neuron_interpretation_merge_results.py --results-dir ./results --output hypotheses.jsonl
+    python neuron_interpretation_merge_results.py --results-dir ./results --output hypotheses.csv
 """
 
 import argparse
@@ -76,7 +76,8 @@ def main():
     # Deduplicate by cell_type (keep last)
     seen = {}
     for r in records:
-        seen[r.get("cell_type", "")] = r
+        key = (r.get("cell_type", ""), r.get("add_function"))
+        seen[key] = r
     records = list(seen.values())
     print(f"Unique cell types: {len(records)}")
 
