@@ -55,8 +55,8 @@ python "$INTERPRET_SCRIPT" \
     --n-steps 4 \
     --top-n 15 \
     --max-tokens 20000 \
-    --no-resume \
-    --no-add-function # whether to map cell types to known functions
+    --no-resume 
+    # --no-add-function # whether to map cell types to known functions
 
 echo "Chunk $CHUNK_ID complete."
 

@@ -81,6 +81,8 @@ def parse_args():
                    help="Port for llama-server (auto-assigned if None)")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                    help="Skip already-processed cell types (--no-resume to disable)")
+    p.add_argument('--side', type=str, default='left', choices=['left', 'right'],
+                   help="Which side of the brain to analyze (left or right)")
     return p.parse_args()
 
 
@@ -363,7 +365,7 @@ Confidence should primarily reflect internal coherence (does the inferred comput
 and completeness (do all input categories contribute meaningfully?). Connection strength is supporting evidence, not the primary criterion."""
 
 
-USER_PROMPT_TEMPLATE = """Cell Type: {cell_type}
+USER_PROMPT_TEMPLATE = """Cell Type: {cell_type} on the {side} hemisphere
 
 Intermediate neurons directly upstream of {cell_type} ({num_intermediates} shown):
 {intermediate_table}
@@ -424,58 +426,77 @@ STRICT FORMAT RULES — VIOLATIONS WILL CAUSE REJECTION AND RETRY:
 # Circuit formatting (from notebook)
 # ---------------------------------------------------------------------------
 
-def format_series(series, top_n):
+def format_series(series, top_n, add_function=True):
     if isinstance(series, pd.DataFrame):
         series = series.iloc[:, 0] if series.shape[1] == 1 else series.sum(axis=1)
-    filtered = series.sort_values(key=lambda x: x.abs(), ascending=False).head(top_n)
+    # get strongly connected, at least on one side 
+    top_n_selected = series.sort_values(key=lambda x: x.abs(), ascending=False).head(top_n)
+    # get the corresponding cell types
+    if add_function:
+        cell_types_selected = top_n_selected.index.map(side_function_to_type)
+        # get the corresponding side_known_function
+        sides_functions = meta.loc[meta.cell_type.isin(cell_types_selected), "side_known_function"]
+    else:
+        cell_types_selected = top_n_selected.index.map(side_random_name_to_type)
+        sides_functions = meta.loc[meta.cell_type.isin(cell_types_selected), "side_random_name"]
+
+    filtered = series[series.index.isin(sides_functions)]
+
     rows = []
     for k, v in filtered.items():
         sign = "Excitatory" if v > 0 else "Inhibitory"
-        rows.append(f"  - {k}: {v:.3f} ({sign})")
+        rows.append(f"  - {k}: {v:.5f} ({sign})")
     return "\n".join(rows) if rows else "  None found", filtered
 
 
-def format_circuit_data(cell_type, intermediate_to_cell, known_to_intermediate,
-                        sensory_to_cell=None, known_to_cell=None, cell_to_known=None,
-                        top_n=15):
+def format_circuit_data(
+    cell_type,
+    intermediate_to_cell,
+    known_to_intermediate,
+    sensory_to_cell=None,
+    known_to_cell=None,
+    cell_to_known=None,
+    top_n=15,
+    side="left",
+    add_function=True,
+):
     # Intermediate → cell
-    inter_table, inter_filtered = format_series(intermediate_to_cell, top_n)
+    inter_table, inter_filtered = format_series(intermediate_to_cell, top_n, add_function=add_function)
 
     # Known → intermediates
     if isinstance(known_to_intermediate, pd.DataFrame):
         valid = [c for c in known_to_intermediate.columns if c in inter_filtered.index]
         kdf = known_to_intermediate[valid]
         known_rows = []
-        conn_count = 0
         for intermediate in inter_filtered.index:
             if intermediate not in kdf.columns:
                 continue
             col = kdf[intermediate].dropna()
-            col = col[col.abs() > 1e-6]
             if len(col) == 0:
                 continue
-            for kf, w in col.sort_values(key=lambda x: x.abs(), ascending=False).head(5).items():
+            for kf, w in (
+                col.sort_values(key=lambda x: x.abs(), ascending=False).head(top_n).items()
+            ):
                 sign = "Excitatory" if w > 0 else "Inhibitory"
-                known_rows.append(f"  - {kf} → {intermediate}: {w:.3f} ({sign})")
-                conn_count += 1
+                known_rows.append(f"  - {kf} → {intermediate}: {w:.5f} ({sign})")
+            known_rows.append('\n')
         known_table = "\n".join(known_rows) if known_rows else "  None found"
     else:
-        known_table, _ = format_series(known_to_intermediate, top_n)
-        conn_count = top_n
+        known_table, _ = format_series(known_to_intermediate, top_n, add_function=add_function)
 
     sensory_table = "  None found"
     if sensory_to_cell is not None:
-        t, _ = format_series(sensory_to_cell, top_n)
+        t, _ = format_series(sensory_to_cell, top_n, add_function=add_function)
         sensory_table = t
 
     known_dn_table = "  None found"
     if known_to_cell is not None:
-        t, _ = format_series(known_to_cell, top_n)
+        t, _ = format_series(known_to_cell, top_n, add_function=add_function)
         known_dn_table = t
 
     dn_output_table = "  None found"
     if cell_to_known is not None:
-        t, _ = format_series(cell_to_known, top_n)
+        t, _ = format_series(cell_to_known, top_n, add_function=add_function)
         dn_output_table = t
 
     return {
@@ -486,95 +507,132 @@ def format_circuit_data(cell_type, intermediate_to_cell, known_to_intermediate,
         "known_dn_table": known_dn_table,
         "dn_output_table": dn_output_table,
         "num_intermediates": len(inter_filtered),
-        "num_known": conn_count,
+        "side": side,
     }
-
 
 # ---------------------------------------------------------------------------
 # Circuit connectivity (from notebook — uses module-level globals)
 # ---------------------------------------------------------------------------
 
-def calculate_circuit_connectivity(dn_type, n_steps, add_function=True):
-    from connectome_interpreter import signed_conn_by_path_length_data, el_within_n_steps
+def calculate_circuit_connectivity(dn_type, n_steps, add_function=True, side="left"):
+    from connectome_interpreter import (
+        signed_conn_by_path_length_data,
+        el_within_n_steps,
+    )
+
+    dn_type_side = dn_type + "_" + side
 
     # Sensory → DN
     esensdn, isensdn = signed_conn_by_path_length_data(
         inprop,
         meta.idx[(meta.super_class == "sensory") & ~meta.cell_type.str.isdigit()],
-        meta.idx[meta.cell_type == dn_type],
-        n_steps, type_to_sign, idx_to_type, idx_to_type,
+        meta.idx[(meta.cell_type == dn_type) & (meta.side == side)],
+        n_steps,
+        type_side_to_sign,
+        idx_to_type_side,
+        idx_to_type_side,
     )
     esensdn_sum = reduce(lambda a, b: a.add(b, fill_value=0), esensdn)
     isensdn_sum = reduce(lambda a, b: a.add(b, fill_value=0), isensdn)
     difference_sensdn = esensdn_sum.subtract(isensdn_sum, fill_value=0)
     if add_function:
-        difference_sensdn.index = difference_sensdn.index.map(cell_type_to_function)
-    else: 
-        difference_sensdn.index = difference_sensdn.index.map(cell_type_to_random_name)
+        difference_sensdn.index = difference_sensdn.index.map(type_side_to_side_function)
+    else:
+        difference_sensdn.index = difference_sensdn.index.map(cell_type_side_to_random_name)
 
     # Circuit within n steps
     circuit = el_within_n_steps(
         inprop,
         meta.idx[(meta.super_class == "sensory") & ~meta.cell_type.str.isdigit()],
-        meta.idx[meta.cell_type == dn_type],
-        n_steps, 0.01, idx_to_type, idx_to_type,
+        meta.idx[(meta.cell_type == dn_type) & (meta.side == side)],
+        n_steps,
+        0.01,
+        idx_to_type_side,
+        idx_to_type_side,
     )
 
     # Direct intermediate → DN
-    intermediate_dn = circuit[(circuit.post == dn_type) & (circuit.pre != dn_type)].copy()
-    intermediate_dn["pre_sign"] = intermediate_dn.pre.map(type_to_sign)
+    intermediate_dn = circuit[
+        # remove self connection, even if on the opposite side 
+        (circuit.post == dn_type_side) & (~circuit.pre.str.contains(dn_type))
+    ].copy()
+    intermediate_dn["pre_sign"] = intermediate_dn.pre.map(type_side_to_sign)
     intermediate_dn["weight"] = intermediate_dn.weight * intermediate_dn.pre_sign
-    if not add_function:
-        intermediate_dn["pre"] = intermediate_dn.pre.map(cell_type_to_random_name)
+    if add_function:
+        intermediate_dn["pre"] = intermediate_dn.pre.map(type_side_to_side_function)
+    else:
+        intermediate_dn["pre"] = intermediate_dn.pre.map(cell_type_side_to_random_name)
     intermediate_dn = intermediate_dn.set_index("pre")["weight"]
 
     # Known → intermediates upstream of DN
     ekunk, ikunk = signed_conn_by_path_length_data(
         inprop,
         meta.idx[(meta.cell_type != meta.known_function) & (meta.cell_type != dn_type)],
-        meta.idx[meta.cell_type.isin(circuit.pre[(circuit.post == dn_type) & (circuit.pre != dn_type)])],
-        n_steps, type_to_sign, idx_to_type, idx_to_type,
+        meta.idx[
+            meta.type_side.isin(
+                circuit.pre[
+                    (circuit.post == dn_type_side) & (~circuit.pre.str.contains(dn_type))
+                ]
+            )
+        ],
+        n_steps,
+        type_side_to_sign,
+        idx_to_type_side,
+        idx_to_type_side,
     )
     ekunk_sum = reduce(lambda a, b: a.add(b, fill_value=0), ekunk)
     ikunk_sum = reduce(lambda a, b: a.add(b, fill_value=0), ikunk)
     difference_kunk = ekunk_sum.subtract(ikunk_sum, fill_value=0)
     if add_function:
-        difference_kunk.index = difference_kunk.index.map(cell_type_to_function)
+        difference_kunk.index = difference_kunk.index.map(type_side_to_side_function)
+        difference_kunk.columns = difference_kunk.columns.map(type_side_to_side_function)
     else:
-        difference_kunk.index = difference_kunk.index.map(cell_type_to_random_name)
+        difference_kunk.index = difference_kunk.index.map(cell_type_side_to_random_name)
+        difference_kunk.columns = difference_kunk.columns.map(cell_type_side_to_random_name)
 
     # Known → DN
     ekdn, ikdn = signed_conn_by_path_length_data(
         inprop,
         meta.idx[(meta.cell_type != meta.known_function) & (meta.cell_type != dn_type)],
-        meta.idx[meta.cell_type == dn_type],
-        n_steps, type_to_sign, idx_to_type, idx_to_type,
+        meta.idx[(meta.cell_type == dn_type) & (meta.side == side)],
+        n_steps,
+        type_side_to_sign,
+        idx_to_type_side,
+        idx_to_type_side,
     )
     ekdn_sum = reduce(lambda a, b: a.add(b, fill_value=0), ekdn)
     ikdn_sum = reduce(lambda a, b: a.add(b, fill_value=0), ikdn)
     difference_kdn = ekdn_sum.subtract(ikdn_sum, fill_value=0)
     if add_function:
-        difference_kdn.index = difference_kdn.index.map(cell_type_to_function)
+        difference_kdn.index = difference_kdn.index.map(type_side_to_side_function)
     else:
-        difference_kdn.index = difference_kdn.index.map(cell_type_to_random_name)
+        difference_kdn.index = difference_kdn.index.map(cell_type_side_to_random_name)
 
     # DN → known
     ednk, idnk = signed_conn_by_path_length_data(
         inprop,
-        meta.idx[meta.cell_type == dn_type],
+        meta.idx[(meta.cell_type == dn_type) & (meta.side == side)],
         meta.idx[(meta.cell_type != meta.known_function) & (meta.cell_type != dn_type)],
-        n_steps, type_to_sign, idx_to_type, idx_to_type,
+        n_steps,
+        type_side_to_sign,
+        idx_to_type_side,
+        idx_to_type_side,
     )
     ednk_sum = reduce(lambda a, b: a.add(b, fill_value=0), ednk)
     idnk_sum = reduce(lambda a, b: a.add(b, fill_value=0), idnk)
     difference_dnk = ednk_sum.subtract(idnk_sum, fill_value=0).T
     if add_function:
-        difference_dnk.index = difference_dnk.index.map(cell_type_to_function)
-    else: 
-        difference_dnk.index = difference_dnk.index.map(cell_type_to_random_name)
+        difference_dnk.index = difference_dnk.index.map(type_side_to_side_function)
+    else:
+        difference_dnk.index = difference_dnk.index.map(cell_type_side_to_random_name)
 
-    return difference_sensdn, intermediate_dn, difference_kunk, difference_kdn, difference_dnk
-
+    return (
+        difference_sensdn,
+        intermediate_dn,
+        difference_kunk,
+        difference_kdn,
+        difference_dnk,
+    )
 
 # ---------------------------------------------------------------------------
 # JSON parsing
@@ -737,7 +795,7 @@ def process_cell(cell_type, args, llama_port=None):
     # Circuit computation
     (difference_sensdn, intermediate_dn, difference_kunk,
      difference_kdn, difference_dnk) = calculate_circuit_connectivity(
-        cell_type, args.n_steps, add_function=args.add_function
+        cell_type, args.n_steps, add_function=args.add_function, side=args.side
     )
 
     # Format data
@@ -749,6 +807,8 @@ def process_cell(cell_type, args, llama_port=None):
         known_to_cell=difference_kdn,
         cell_to_known=difference_dnk,
         top_n=args.top_n,
+        side=args.side,
+        add_function=args.add_function,
     )
 
     user_prompt = USER_PROMPT_TEMPLATE.format(**fmt)
@@ -811,7 +871,7 @@ def main():
     print("Loading connectome data...")
     base_path = args.base_path
 
-    global inprop, meta, cell_type_to_function, type_to_sign, idx_to_type, cell_type_to_random_name
+    global inprop, meta, cell_type_to_function, type_to_sign, idx_to_type, cell_type_to_random_name, idx_to_type_side, type_side_to_sign, cell_type_side_to_random_name, type_side_to_side_function, side_function_to_type, side_random_name_to_type
 
     cell_type_to_function_df = pd.read_csv(os.path.expanduser(args.known_types_csv))
     cell_type_to_function = dict(
@@ -827,8 +887,10 @@ def main():
     )
     meta["type_side"] = meta.cell_type + "_" + meta.side
 
+    idx_to_type_side = dict(zip(meta.idx, meta.type_side))
     idx_to_type = dict(zip(meta.idx, meta.cell_type))
     type_to_sign = dict(zip(meta.cell_type, meta.sign))
+    type_side_to_sign = dict(zip(meta.type_side, meta.sign))
 
     meta.loc[meta.cell_type.isin(cell_type_to_function), "known_function"] = (
         meta[meta.cell_type.isin(cell_type_to_function)].cell_type.map(cell_type_to_function)
@@ -841,9 +903,19 @@ def main():
     )
     meta["known_function"] = meta["known_function"].fillna(meta.cell_type)
     cell_type_to_function = dict(zip(meta.cell_type, meta.known_function))
-    random_names = [f"cell_type_{i}" for i in range(len(set(meta.cell_type[~meta.cell_type.str.isdigit()])))]
-    cell_type_to_random_name = dict(zip(meta.cell_type[~meta.cell_type.str.isdigit()].unique(), random_names))
 
+    meta['side_known_function'] = meta.side + " " + meta.known_function
+    type_side_to_side_function = dict(zip(meta.cell_type + "_" + meta.side, meta.side_known_function))
+    side_function_to_type = dict(zip(meta.side_known_function, meta.cell_type))
+
+    # random cell type names preserving side correspondence 
+    random_names = [f"cell_type_{i}" for i in range(len(set(meta.cell_type)))]
+    cell_type_to_random_name = dict(zip(meta.cell_type.unique(), random_names))
+    meta['random_name'] = meta.cell_type.map(cell_type_to_random_name)
+    meta['side_random_name'] = meta.cell_type.map(cell_type_to_random_name) + "_" + meta.side
+    cell_type_side_to_random_name = dict(zip(meta.cell_type + "_" + meta.side, meta.side_random_name))
+    side_random_name_to_type = dict(zip(meta.side_random_name, meta.cell_type))
+    
     # ---- Build dns list ----
     known_types = set(
         meta.cell_type[(meta.cell_type != meta.known_function) & (meta.super_class != "sensory")]
@@ -915,6 +987,10 @@ def main():
     try:
         with open(out_file, "a") as f:
             for cell_type in tqdm(chunk, desc=f"Chunk {args.chunk_id}"):
+                # first check if this cell type exists with this side 
+                if not ((meta.cell_type == cell_type) & (meta.side == args.side)).any():
+                    print(f"  [skipping] {cell_type} on side {args.side} not found in metadata")
+                    continue
                 # Check server health before each cell; restart if needed
                 if args.provider == "llama":
                     if not is_llama_server_healthy(llama_port):
