@@ -428,6 +428,7 @@ RULES:
 - Keep descriptions concise (generally no need for precise numbers)
 - Include multiple behavioral/sensory aspects if the paper tested them
 - If an aspect is not tested or described, leave it blank
+- Cell type naming: Use the exact name from the connectome if the paper makes this clear (e.g. "LC4", "PPL106", "DA1_lPN"). If the paper studies neurons only by a GAL4 driver line that does not correspond to a single cell type, use the driver line name. If multiple cell types are studied together without being separable, list them all separately. Never invent or infer a connectome name that isn't stated or clearly implied by the paper.
 
 EXAMPLES of what to extract:
 - "Motion detection: LC4 neurons respond to ON-motion with increased firing (two-photon imaging). Optogenetic activation biases turning towards the direction of motion (behavioral arena); inactivation reduces turns. Likely useful for course control during navigation."
