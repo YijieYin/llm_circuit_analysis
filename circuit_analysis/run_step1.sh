@@ -57,9 +57,9 @@ python "$SCRIPT_DIR/circuit_step1_pairwise.py" \
     --side right \
     --n-steps 3 \
     --threshold 0.01 \
-    --max-tokens 4096 \
-    --resume
-    # --actor-critic --max-critic-rounds 2  # uncomment to enable iterative critic-revision loop
+    --max-tokens 20000 \
+    --actor-critic --max-critic-rounds 1  # uncomment to enable iterative critic-revision loop
+    # --resume
 
 echo "Step 1 chunk $CHUNK_ID complete."
 

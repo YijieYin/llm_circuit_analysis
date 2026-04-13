@@ -171,7 +171,7 @@ sbatch run_step2.sh            # per-target integration (array job, after step 1
 sbatch run_step3.sh            # circuit synthesis (single job, after step 2)
 ```
 
-All scripts support `--resume` by default: resubmitting a failed or partial run will skip already-completed entries.
+All scripts support `--resume`: resubmitting a failed or partial run will skip already-completed entries.
 
 #### Output files
 
@@ -206,10 +206,10 @@ Override the default model with `--model <model-name>`.
 | `--side` | `right` | Hemisphere to analyse (`left` or `right`) |
 | `--n-steps` | `3` | Max synaptic hops for path finding |
 | `--threshold` | `0.01` | Minimum synaptic weight to include |
-| `--max-tokens` | `4096` | Max tokens per LLM response |
+| `--max-tokens` | `20000` | Max tokens per LLM response |
 | `--resume` | on | Skip already-processed entries on resubmission |
-| `--actor-critic` | off | Enable critic-revision loop in step 1 |
-| `--max-critic-rounds` | `2` | Max revision rounds per pair |
+| `--actor-critic` | on | Enable critic-revision loop in step 1 |
+| `--max-critic-rounds` | `1` | Max revision rounds per pair |
 | `--shared-intermediates` | off | Include convergence analysis in step 2 |
 
 ### Neuron interpretation

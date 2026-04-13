@@ -47,6 +47,6 @@ python "$SCRIPT_DIR/circuit_step3_synthesis.py" \
     --step1-dir "$STEP1_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --side right \
-    --max-tokens 8192
+    --max-tokens 20000
 
 echo "Step 3 complete. Results in $OUTPUT_DIR/circuit_synthesis.json"

@@ -59,8 +59,8 @@ python "$SCRIPT_DIR/circuit_step2_per_target.py" \
     --side right \
     --n-steps 3 \
     --threshold 0.01 \
-    --max-tokens 4096 \
-    --resume
+    --max-tokens 20000 
+    # --resume
     # --shared-intermediates --shared-intermediates-top-k 10  # uncomment to include convergence analysis
 
 echo "Step 2 chunk $CHUNK_ID complete."
