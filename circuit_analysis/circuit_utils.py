@@ -374,7 +374,7 @@ def load_connectome_data(base_path, known_types_csv):
     )
 
     inprop = sp.sparse.load_npz(
-        os.path.join(base_path, "data", "fafb_all_neuron", "fafb_inprop_all_neuron.npz")
+        os.path.join(base_path, "data", "fafb_all_neuron", "fafb_ad_inprop_all_neuron.npz")
     )
     meta = pd.read_csv(
         os.path.join(base_path, "data", "fafb_all_neuron", "fafb_all_neuron_meta.csv"),

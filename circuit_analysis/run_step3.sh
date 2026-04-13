@@ -18,7 +18,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate llm
 
 # ---- Config ----
-SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_interpretation"
+SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_analysis"
 HYPOTHESES_CSV="$HOME/llm_circuit_analysis/neuron_interpretation/hypotheses.csv"
 TYPES_FILE="$SCRIPT_DIR/circuit_types.json"
 GGUF="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q6_K_L.gguf"

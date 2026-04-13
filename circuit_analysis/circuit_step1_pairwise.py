@@ -64,7 +64,7 @@ Focus on:
   the net effect? What does the sign pattern enable (e.g., disinhibition, gating, gain control)?
 - Why might this circuit route through these specific intermediates rather than a direct connection?
   What computational advantage does this multi-step pathway provide?
-- Laterality: does the signal cross sides? What might that mean functionally?
+- Laterality: does the side the input comes from (ipsi vs contra) matter in this case? If so, how?
 
 Be MECHANISTIC, not descriptive. Do not just restate connectivity — explain what computation it implements.
 

@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_interpretation"
+SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_analysis"
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
     DRY_RUN=true

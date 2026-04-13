@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=circuit_s2
-#SBATCH --array=0-3                  # Fewer chunks — one per target typically
+#SBATCH --array=0-7                  # should one per target, max 8 because of GPU limits
 #SBATCH --partition=ml
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/circuit_s2_%A_%a.out
@@ -19,10 +19,10 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate llm
 
 # ---- Config ----
-N_CHUNKS=4
+N_CHUNKS=8
 CHUNK_ID=$SLURM_ARRAY_TASK_ID
 
-SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_interpretation"
+SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_analysis"
 BASE_PATH="$HOME/interpret_connectome/"
 KNOWN_TYPES_CSV="$HOME/known_types_snapshots/known_types_140326.csv"
 HYPOTHESES_CSV="$HOME/llm_circuit_analysis/neuron_interpretation/hypotheses.csv"

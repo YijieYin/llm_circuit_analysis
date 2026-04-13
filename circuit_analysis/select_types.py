@@ -20,7 +20,7 @@ import pandas as pd
 
 # ---- Configuration: edit these paths to match your setup ----
 KNOWN_TYPES_CSV = os.path.expanduser(
-    "~/Downloads/known_types_snapshots/known_types_100226.csv"
+    "../../known_types_snapshots/known_types_140326.csv"
 )
 META_CSV = os.path.join(
     "../../interpret_connectome/data/fafb_all_neuron/fafb_all_neuron_meta.csv"

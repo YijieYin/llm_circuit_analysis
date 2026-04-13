@@ -22,7 +22,7 @@ conda activate llm
 N_CHUNKS=8
 CHUNK_ID=$SLURM_ARRAY_TASK_ID
 
-SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_interpretation"
+SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_analysis"
 BASE_PATH="$HOME/interpret_connectome/"
 KNOWN_TYPES_CSV="$HOME/known_types_snapshots/known_types_140326.csv"
 HYPOTHESES_CSV="$HOME/llm_circuit_analysis/neuron_interpretation/hypotheses.csv"
