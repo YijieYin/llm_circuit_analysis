@@ -3,8 +3,8 @@
 #SBATCH --array=0-7                  # should one per target, max 8 because of GPU limits
 #SBATCH --partition=ml
 #SBATCH --gres=gpu:1
-#SBATCH --output=logs/circuit_s2_%A_%a.out
-#SBATCH --error=logs/circuit_s2_%A_%a.err
+#SBATCH --output=circuit_analysis/logs/circuit_s2_%A_%a.out
+#SBATCH --error=circuit_analysis/logs/circuit_s2_%A_%a.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=yy432@cam.ac.uk
 
@@ -31,6 +31,8 @@ GGUF="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q6_K_L.gguf
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 STEP1_DIR="$SCRIPT_DIR/results_step1"
 OUTPUT_DIR="$SCRIPT_DIR/results_step2"
+
+DATASET="maleCNS"  # 'FAFB' or 'maleCNS'
 
 mkdir -p "$SCRIPT_DIR/logs"
 mkdir -p "$OUTPUT_DIR"
@@ -59,7 +61,8 @@ python "$SCRIPT_DIR/circuit_step2_per_target.py" \
     --side right \
     --n-steps 3 \
     --threshold 0.01 \
-    --max-tokens 20000 
+    --max-tokens 20000 \
+    --dataset "$DATASET"
     # --resume
     # --shared-intermediates --shared-intermediates-top-k 10  # uncomment to include convergence analysis
 

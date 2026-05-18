@@ -1,367 +1,110 @@
 """
-circuit_utils.py — Shared utilities for the circuit analysis pipeline.
+circuit_utils.py — Connectome-specific utilities for the circuit analysis pipeline.
 
-Contains:
-  - LLM provider wrappers (llama, openai, anthropic)
-  - JSON parsing / validation
-  - Connectome data loading
-  - Path formatting for LLM prompts
+Provider-agnostic LLM utilities (call_llm, parse_llm_response, llama-server
+lifecycle, JSON validation, retry logic) live in the `llm_core` package and
+are re-exported here for backward compatibility — circuit_step{1,2,3}.py
+keep their existing `from circuit_utils import ...` imports unchanged.
+
+This module owns the connectome-specific code:
+  - load_connectome_data (FAFB / maleCNS)
+  - load_hypotheses
+  - find_paths_for_pair
+  - compute_net_signed_effect
+  - format_paths_by_recipient
+  - format_known_to_target
+  - compute_shared_intermediates
+  - format_net_effect_table
+  - build_source_target_matrix
+  - add_connectome_args (CLI)
+  - add_common_args (CLI: LLM + connectome combined)
+  - load_types_file
 """
 
 import argparse
-import json
 import os
-import re
-import socket
-import subprocess
-import time
 from functools import reduce
 from pathlib import Path
+import json
 
 import pandas as pd
 import scipy as sp
 
-
 # ---------------------------------------------------------------------------
-# Provider defaults & model config
-# ---------------------------------------------------------------------------
-
-PROVIDER_DEFAULTS = {
-    "llama":     "qwen3.5:35b",
-    "openai":    "gpt-4o",
-    "anthropic": "claude-sonnet-4-6",
-}
-
-RESPONSES_API_MODELS = {"gpt-5", "gpt-5.4"}
-
-MODEL_DEFAULTS = {
-    "gpt-4o":       {"temperature": 1.0},
-    "gpt-4-turbo":  {"temperature": 1.0},
-    "gpt-4":        {"temperature": 1.0},
-    "gpt-5":        {"temperature": 1.0},
-    "gpt-5.4":      {"temperature": 1.0, "reasoning_effort": "medium", "verbosity": "low"},
-}
-
-
-def resolve_model_config(model_name, extra_config=None):
-    config = {"model": model_name}
-    if model_name in MODEL_DEFAULTS:
-        config.update(MODEL_DEFAULTS[model_name])
-    if extra_config:
-        config.update(extra_config)
-    return config
-
-
-def _use_responses_api(model_name):
-    return model_name in RESPONSES_API_MODELS
-
-
-# ---------------------------------------------------------------------------
-# llama-server management
+# Re-export from llm_core so existing scripts (circuit_step*.py) still work
+# unchanged. Anyone writing new code is encouraged to import from llm_core
+# directly.
 # ---------------------------------------------------------------------------
 
-def find_free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def start_llama_server(llama_bin, gguf_path, port):
-    env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = "/public/gcc/12_2_0/lib64:" + env.get("LD_LIBRARY_PATH", "")
-    cmd = [
-        llama_bin, "-m", gguf_path,
-        "--port", str(port),
-        "-ngl", "99", "--ctx-size", "24576",
-        "--no-mmap", "-np", "1",
-    ]
-    print(f"[llama-server] Starting on port {port}: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-    return proc
-
-
-def is_llama_server_healthy(port):
-    import urllib.request
-    try:
-        with urllib.request.urlopen(f"http://localhost:{port}/health", timeout=5) as r:
-            return json.loads(r.read()).get("status") == "ok"
-    except Exception:
-        return False
-
-
-def wait_for_llama_server(port, timeout=300):
-    import urllib.request
-    url = f"http://localhost:{port}/health"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as r:
-                if json.loads(r.read()).get("status") == "ok":
-                    print(f"[llama-server] Health check passed on port {port}, waiting for model load...")
-                    time.sleep(30)
-                    print(f"[llama-server] Ready on port {port}")
-                    return True
-        except Exception:
-            pass
-        time.sleep(3)
-    raise TimeoutError(f"llama-server did not start within {timeout}s")
-
-
-def restart_llama_server(llama_bin, gguf_path, port, old_proc=None):
-    if old_proc is not None:
-        print("[llama-server] Restarting...")
-        old_proc.terminate()
-        try:
-            old_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            old_proc.kill()
-    proc = start_llama_server(llama_bin, gguf_path, port)
-    wait_for_llama_server(port)
-    print("[llama-server] Warmup after restart...")
-    try:
-        call_llama("You are helpful.", "Say OK.", port, max_tokens=512)
-    except Exception:
-        pass
-    return proc
+from llm_core import (
+    # providers
+    PROVIDER_DEFAULTS,
+    MODEL_DEFAULTS,
+    RESPONSES_API_MODELS,
+    resolve_model_config,
+    call_llama,
+    call_openai,
+    call_anthropic,
+    call_llm,
+    # llama-server
+    find_free_port,
+    start_llama_server,
+    wait_for_llama_server,
+    is_llama_server_healthy,
+    restart_llama_server,
+    setup_llama_server,
+    # parsing
+    parse_llm_response,
+    validate_response,
+    # retry
+    call_llm_with_retry,
+    MAX_RETRIES,
+    # CLI
+    add_llm_args,
+)
 
 
 # ---------------------------------------------------------------------------
-# LLM call wrappers
+# CLI: connectome-specific args
 # ---------------------------------------------------------------------------
 
-def call_llama(system_prompt, user_prompt, port, max_tokens=4096, retries=3):
-    from openai import OpenAI
-    client = OpenAI(base_url=f"http://localhost:{port}/v1", api_key="not-needed")
-    for attempt in range(retries):
-        response = client.chat.completions.create(
-            model="",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=max_tokens,
-        )
-        text = response.choices[0].message.content or ""
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        if text and text.strip():
-            return text, response
-        print(f"  [llama] Empty response on attempt {attempt + 1}/{retries}, retrying...")
-        time.sleep(5)
-    raise ValueError(f"llama-server returned empty response after {retries} attempts")
+def add_connectome_args(parser):
+    """Add connectome-specific CLI args (paths, hemisphere, path-search params)."""
+    parser.add_argument("--base-path", type=str, default="../../interpret_connectome/")
+    parser.add_argument("--known-types-csv", type=str,
+                        default="~/Downloads/known_types_snapshots/known_types_100226.csv")
+    parser.add_argument("--hypotheses-csv", type=str, default="hypotheses.csv",
+                        help="CSV from neuron_interpretation_merge_results.py")
+    parser.add_argument("--types-file", type=str, default="circuit_types.json",
+                        help="JSON file with 'sources' and 'targets' lists")
+    parser.add_argument("--side", type=str, default="right", choices=["left", "right"])
+    parser.add_argument("--n-steps", type=int, default=3)
+    parser.add_argument("--threshold", type=float, default=0.01,
+                        help="Minimum weight threshold for path filtering")
+    return parser
 
 
-def call_openai(system_prompt, user_prompt, model_name, max_tokens=4096,
-                reasoning_effort=None, verbosity=None, temperature=None):
-    from openai import OpenAI
-    client = OpenAI()
-    if _use_responses_api(model_name):
-        api_params = {
-            "model": model_name, "input": user_prompt,
-            "instructions": system_prompt, "max_completion_tokens": max_tokens,
-            "store": True,
-        }
-        if verbosity:
-            api_params["text"] = {"verbosity": verbosity}
-        if reasoning_effort:
-            api_params["reasoning"] = {"effort": reasoning_effort}
-        response = client.responses.create(**api_params)
-        return response.output_text, response
-    else:
-        api_params = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": max_tokens,
-        }
-        if temperature is not None and "o1" not in model_name.lower():
-            api_params["temperature"] = temperature
-        if reasoning_effort and "o1" in model_name.lower():
-            api_params["reasoning_effort"] = reasoning_effort
-        response = client.chat.completions.create(**api_params)
-        return response.choices[0].message.content, response
+def add_common_args(parser):
+    """Add all CLI args used by the circuit_step* scripts (LLM + connectome).
 
-
-def call_anthropic(system_prompt, user_prompt, model_name, max_tokens=4096,
-                   thinking_budget=None):
-    from anthropic import Anthropic
-    client = Anthropic()
-    api_params = {
-        "model": model_name, "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }
-    if thinking_budget:
-        api_params["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-    response = client.messages.create(**api_params)
-    text = "".join(b.text for b in response.content if hasattr(b, "text"))
-    return text, response
-
-
-def call_llm(system_prompt, user_prompt, provider, model_name, max_tokens,
-             llama_port=None, thinking_budget=None, reasoning_effort=None,
-             verbosity=None, temperature=None):
-    if provider == "llama":
-        return call_llama(system_prompt, user_prompt, llama_port, max_tokens)
-    elif provider == "openai":
-        return call_openai(system_prompt, user_prompt, model_name, max_tokens,
-                           reasoning_effort=reasoning_effort, verbosity=verbosity,
-                           temperature=temperature)
-    elif provider == "anthropic":
-        return call_anthropic(system_prompt, user_prompt, model_name, max_tokens,
-                              thinking_budget=thinking_budget)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    Backward-compatible wrapper around add_llm_args + add_connectome_args.
+    New code can call them separately if only one set is needed.
+    """
+    add_llm_args(parser)
+    add_connectome_args(parser)
+    return parser
 
 
 # ---------------------------------------------------------------------------
-# JSON parsing (same robust multi-strategy parser)
+# Connectome-specific code below this line is unchanged from the original
+# circuit_utils.py — pasted verbatim. Edit here only if the connectome logic
+# itself changes.
 # ---------------------------------------------------------------------------
-
-def _try_parse(text):
-    return json.loads(text)
-
-
-def _strip_markdown_fences(text):
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```\s*', '', text)
-    return text.strip()
-
-
-def _merge_json_blocks(text):
-    merged = {}
-    depth = 0
-    start = None
-    candidates = []
-    for i, ch in enumerate(text):
-        if ch == '{':
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0 and start is not None:
-                candidates.append(text[start:i+1])
-                start = None
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                merged.update(parsed)
-        except json.JSONDecodeError:
-            pass
-    return merged if merged else None
-
-
-def _fix_common_syntax_errors(text):
-    text = _strip_markdown_fences(text)
-    text = re.sub(r'\*(\w)', r'\1', text)
-    text = re.sub(r',\s*([\}\]])', r'\1', text)
-    return text
-
-
-def _recover_truncated_json(text):
-    result = {}
-    for m in re.finditer(r'"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"', text):
-        result[m.group(1)] = m.group(2)
-    for m in re.finditer(r'"(\w+)"\s*:\s*(true|false|null|-?\d+\.?\d*)', text):
-        v = m.group(2)
-        if v == 'true': v = True
-        elif v == 'false': v = False
-        elif v == 'null': v = None
-        else:
-            try: v = float(v) if '.' in v else int(v)
-            except ValueError: pass
-        result[m.group(1)] = v
-    return result if result else None
-
-
-def parse_llm_response(text):
-    if not text or not text.strip():
-        return {"error": "Empty response"}
-    strategies = [
-        lambda t: _try_parse(t),
-        lambda t: _try_parse(_strip_markdown_fences(t)),
-        lambda t: _try_parse(_fix_common_syntax_errors(t)),
-        lambda t: _merge_json_blocks(t),
-        lambda t: _try_parse(_fix_common_syntax_errors(
-            re.search(r'\{.*\}', t, re.DOTALL).group()
-        )) if re.search(r'\{.*\}', t, re.DOTALL) else None,
-    ]
-    for strategy in strategies:
-        try:
-            result = strategy(text)
-            if result and isinstance(result, dict) and len(result) > 0:
-                return result
-        except Exception:
-            continue
-    partial = _recover_truncated_json(text)
-    if partial:
-        partial["error"] = "truncated_response_partial_recovery"
-        return partial
-    return {"error": "JSON parse failed", "raw_response": text}
-
-
-def validate_response(parsed, required_keys):
-    """Check parsed dict has exactly the required keys. Returns (ok, reason)."""
-    if "error" in parsed and not required_keys.intersection(parsed.keys()):
-        return False, f"parse error: {parsed.get('error')}"
-    missing = required_keys - parsed.keys()
-    # Allow metadata keys we add ourselves
-    meta_keys = {"source", "target", "model", "provider", "chunk_id",
-                 "validation_error", "sources", "targets",
-                 "net_excit", "net_inhib", "critic_flag",
-                 "critic_rounds", "critic_approved", "critic_history"}
-    extra = parsed.keys() - required_keys - meta_keys
-    if missing:
-        return False, f"missing keys: {missing}"
-    if extra:
-        return False, f"extra keys present: {extra}"
-    return True, ""
-
-
-MAX_RETRIES = 3
-
-
-def call_llm_with_retry(system_prompt, user_prompt, required_keys, args,
-                         llama_port=None):
-    """Call LLM with retry logic and JSON validation."""
-    config = resolve_model_config(args.model)
-    reasoning_effort = config.get("reasoning_effort", getattr(args, "reasoning_effort", None))
-    verbosity = config.get("verbosity", getattr(args, "verbosity", None))
-    temperature = config.get("temperature", None)
-
-    last_result = None
-    for attempt in range(MAX_RETRIES):
-        response_text, _ = call_llm(
-            system_prompt, user_prompt,
-            provider=args.provider,
-            model_name=args.model,
-            max_tokens=args.max_tokens,
-            llama_port=llama_port,
-            thinking_budget=getattr(args, "thinking_budget", None),
-            reasoning_effort=reasoning_effort,
-            verbosity=verbosity,
-            temperature=temperature,
-        )
-        result = parse_llm_response(response_text)
-        ok, reason = validate_response(result, required_keys)
-        if ok:
-            return result
-        print(f"  [retry {attempt+1}/{MAX_RETRIES}] {reason}")
-        last_result = result
-
-    result = last_result or result
-    result["validation_error"] = reason
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_connectome_data(base_path, known_types_csv):
+def load_connectome_data(base_path, known_types_csv, dataset = 'FAFB'):
     """Load connectome data and build all lookup dicts.
     
     Returns a dict with all the data structures needed by the pipeline.
@@ -373,41 +116,67 @@ def load_connectome_data(base_path, known_types_csv):
         zip(cell_type_to_function_df.cell_type, cell_type_to_function_df.known_function)
     )
 
-    inprop = sp.sparse.load_npz(
-        os.path.join(base_path, "data", "fafb_all_neuron", "fafb_ad_inprop_all_neuron.npz")
-    )
-    meta = pd.read_csv(
-        os.path.join(base_path, "data", "fafb_all_neuron", "fafb_all_neuron_meta.csv"),
-        index_col=0, low_memory=False,
-    )
-    meta["type_side"] = meta.cell_type + "_" + meta.side
+    if dataset == 'FAFB':
+        inprop = sp.sparse.load_npz(
+            os.path.join(base_path, "data", "fafb_all_neuron", "fafb_ad_inprop_all_neuron.npz")
+        )
+        meta = pd.read_csv(
+            os.path.join(base_path, "data", "fafb_all_neuron", "fafb_all_neuron_meta.csv"),
+            index_col=0, low_memory=False,
+        )
+        meta["type_side"] = meta.cell_type + "_" + meta.side
 
+        # Apply known functions
+        meta.loc[meta.cell_type.isin(cell_type_to_function), "known_function"] = (
+            meta[meta.cell_type.isin(cell_type_to_function)].cell_type.map(cell_type_to_function)
+        )
+        meta.loc[meta.super_class == "motor", "known_function"] = meta[
+            meta.super_class == "motor"
+        ].agg(
+            lambda x: x["cell_sub_class"]
+            if x["cell_type"] == x["known_function"] else x["known_function"],
+            axis=1,
+        )
+        meta["known_function"] = meta["known_function"].fillna(meta.cell_type)
+        cell_type_to_function = dict(zip(meta.cell_type, meta.known_function))
+
+        meta["side_known_function"] = meta.side + " " + meta.known_function
+        type_side_to_side_function = dict(
+            zip(meta.cell_type + "_" + meta.side, meta.side_known_function)
+        )
+        type_side_to_function = dict(zip(meta.type_side, meta.known_function))
+        side_function_to_type = dict(zip(meta.side_known_function, meta.cell_type))
+    elif dataset == 'maleCNS': 
+        inprop = sp.sparse.load_npz(
+            os.path.join(base_path, "data", "maleCNS", "mcns_ad_inprop_all_neuron.npz")
+        )
+        meta = pd.read_csv(
+            os.path.join(base_path, "data", "maleCNS", "mcns_all_neuron_meta.csv"),
+            index_col=0, low_memory=False,
+        )
+        meta['side'] = meta.somaSide.replace({'L': 'left', 'R': 'right', 'M': 'center'})
+        meta['type_side'] = meta.cell_type + '_' + meta.side
+
+        # Apply known functions
+        meta.loc[meta.cell_type.isin(cell_type_to_function), "known_function"] = (
+            meta[meta.cell_type.isin(cell_type_to_function)].cell_type.map(cell_type_to_function)
+        )
+        # TODO motor neuron functions 
+        meta["known_function"] = meta["known_function"].fillna(meta.cell_type)
+        cell_type_to_function = dict(zip(meta.cell_type, meta.known_function))
+        meta["side_known_function"] = meta.side + " " + meta.known_function
+        type_side_to_side_function = dict(
+            zip(meta.cell_type + "_" + meta.side, meta.side_known_function)
+        )
+        type_side_to_function = dict(zip(meta.type_side, meta.known_function))
+        side_function_to_type = dict(zip(meta.side_known_function, meta.cell_type))
+    
     idx_to_type_side = dict(zip(meta.idx, meta.type_side))
     idx_to_type = dict(zip(meta.idx, meta.cell_type))
     type_to_sign = dict(zip(meta.cell_type, meta.sign))
     type_side_to_sign = dict(zip(meta.type_side, meta.sign))
     type_side_to_type = dict(zip(meta.type_side, meta.cell_type))
-
-    # Apply known functions
-    meta.loc[meta.cell_type.isin(cell_type_to_function), "known_function"] = (
-        meta[meta.cell_type.isin(cell_type_to_function)].cell_type.map(cell_type_to_function)
-    )
-    meta.loc[meta.super_class == "motor", "known_function"] = meta[
-        meta.super_class == "motor"
-    ].agg(
-        lambda x: x["cell_sub_class"]
-        if x["cell_type"] == x["known_function"] else x["known_function"],
-        axis=1,
-    )
-    meta["known_function"] = meta["known_function"].fillna(meta.cell_type)
-    cell_type_to_function = dict(zip(meta.cell_type, meta.known_function))
-
-    meta["side_known_function"] = meta.side + " " + meta.known_function
-    type_side_to_side_function = dict(
-        zip(meta.cell_type + "_" + meta.side, meta.side_known_function)
-    )
-    type_side_to_function = dict(zip(meta.type_side, meta.known_function))
-    side_function_to_type = dict(zip(meta.side_known_function, meta.cell_type))
+    
 
     return {
         "inprop": inprop,
@@ -866,40 +635,6 @@ def build_source_target_matrix(step1_dir):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Common CLI arguments
-# ---------------------------------------------------------------------------
-
-def add_common_args(parser):
-    """Add CLI arguments shared across all pipeline steps."""
-    parser.add_argument("--provider", type=str, default="llama",
-                        choices=["llama", "openai", "anthropic"])
-    parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--gguf", type=str,
-                        default="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf")
-    parser.add_argument("--llama-bin", type=str,
-                        default=os.path.expanduser("~/llama.cpp/build/bin/llama-server"))
-    parser.add_argument("--base-path", type=str, default="../../interpret_connectome/")
-    parser.add_argument("--known-types-csv", type=str,
-                        default="~/Downloads/known_types_snapshots/known_types_100226.csv")
-    parser.add_argument("--hypotheses-csv", type=str, default="hypotheses.csv",
-                        help="CSV from neuron_interpretation_merge_results.py")
-    parser.add_argument("--types-file", type=str, default="circuit_types.json",
-                        help="JSON file with 'sources' and 'targets' lists")
-    parser.add_argument("--side", type=str, default="right", choices=["left", "right"])
-    parser.add_argument("--n-steps", type=int, default=3)
-    parser.add_argument("--threshold", type=float, default=0.01,
-                        help="Minimum weight threshold for path filtering")
-    parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--thinking-budget", type=int, default=None)
-    parser.add_argument("--reasoning-effort", type=str, default=None,
-                        choices=["low", "medium", "high"])
-    parser.add_argument("--verbosity", type=str, default=None,
-                        choices=["low", "medium", "high"])
-    parser.add_argument("--llama-port", type=int, default=None)
-    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    return parser
-
 
 def load_types_file(path):
     """Load the circuit_types.json file."""
@@ -910,37 +645,3 @@ def load_types_file(path):
     print(f"Sources ({len(sources)}): {sources}")
     print(f"Targets ({len(targets)}): {targets}")
     return sources, targets
-
-
-
-# ---------------------------------------------------------------------------
-# llama-server lifecycle for scripts
-# ---------------------------------------------------------------------------
-
-def setup_llama_server(args):
-    """Start and warm up llama-server. Returns (proc, port)."""
-    port = args.llama_port or find_free_port()
-    proc = start_llama_server(args.llama_bin, args.gguf, port)
-    try:
-        wait_for_llama_server(port)
-    except TimeoutError as e:
-        proc.terminate()
-        raise
-
-    print("[llama-server] Warming up model...")
-    warmup_deadline = time.time() + 120
-    warmed = False
-    while time.time() < warmup_deadline:
-        try:
-            call_llama("You are helpful.", "Say OK.", port, max_tokens=512)
-            print("[llama-server] Warmup complete.")
-            warmed = True
-            break
-        except Exception as e:
-            print(f"[llama-server] Warmup attempt failed ({e}), retrying in 10s...")
-            time.sleep(10)
-    if not warmed:
-        proc.terminate()
-        raise RuntimeError("llama-server failed to generate tokens after 120s warmup")
-
-    return proc, port

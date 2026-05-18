@@ -2,8 +2,8 @@
 #SBATCH --job-name=circuit_s3
 #SBATCH --partition=ml
 #SBATCH --gres=gpu:1
-#SBATCH --output=logs/circuit_s3_%j.out
-#SBATCH --error=logs/circuit_s3_%j.err
+#SBATCH --output=circuit_analysis/logs/circuit_s3_%j.out
+#SBATCH --error=circuit_analysis/logs/circuit_s3_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=yy432@cam.ac.uk
 

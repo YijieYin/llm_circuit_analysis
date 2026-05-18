@@ -3,8 +3,8 @@
 #SBATCH --array=0-7                  # 8 jobs — adjust to match N_CHUNKS
 #SBATCH --partition=ml
 #SBATCH --gres=gpu:1
-#SBATCH --output=logs/circuit_s1_%A_%a.out
-#SBATCH --error=logs/circuit_s1_%A_%a.err
+#SBATCH --output=circuit_analysis/logs/circuit_s1_%A_%a.out
+#SBATCH --error=circuit_analysis/logs/circuit_s1_%A_%a.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=yy432@cam.ac.uk
 
@@ -24,12 +24,14 @@ CHUNK_ID=$SLURM_ARRAY_TASK_ID
 
 SCRIPT_DIR="$HOME/llm_circuit_analysis/circuit_analysis"
 BASE_PATH="$HOME/interpret_connectome/"
-KNOWN_TYPES_CSV="$HOME/known_types_snapshots/known_types_140326.csv"
+KNOWN_TYPES_CSV="$HOME/known_types_snapshots/known_types_140526.csv"
 HYPOTHESES_CSV="$HOME/llm_circuit_analysis/neuron_interpretation/hypotheses.csv"
 TYPES_FILE="$SCRIPT_DIR/circuit_types.json"
 GGUF="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q6_K_L.gguf"
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 OUTPUT_DIR="$SCRIPT_DIR/results_step1"
+
+DATASET="maleCNS"  # 'FAFB' or 'maleCNS'
 
 mkdir -p "$SCRIPT_DIR/logs"
 mkdir -p "$OUTPUT_DIR"
@@ -58,6 +60,7 @@ python "$SCRIPT_DIR/circuit_step1_pairwise.py" \
     --n-steps 3 \
     --threshold 0.01 \
     --max-tokens 20000 \
+    --dataset "$DATASET" \
     --actor-critic --max-critic-rounds 1  # uncomment to enable iterative critic-revision loop
     # --resume
 

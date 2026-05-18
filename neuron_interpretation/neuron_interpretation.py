@@ -20,10 +20,6 @@ Provider options:
 import argparse
 import json
 import os
-import re
-import subprocess
-import time
-import socket
 from functools import reduce
 from pathlib import Path
 
@@ -32,6 +28,12 @@ import pandas as pd
 import scipy as sp
 from tqdm import tqdm
 
+from llm_core import (
+    PROVIDER_DEFAULTS, resolve_model_config,
+    call_llm, call_llm_with_retry,
+    setup_llama_server, restart_llama_server, is_llama_server_healthy,
+    parse_llm_response, validate_response,
+)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -83,238 +85,10 @@ def parse_args():
                    help="Skip already-processed cell types (--no-resume to disable)")
     p.add_argument('--side', type=str, default='left', choices=['left', 'right'],
                    help="Which side of the brain to analyze (left or right)")
+    p.add_argument("--dump-prompts", type=str, default=None,
+               help="Instead of calling the LLM, write one .md prompt file "
+                    "per cell type to this directory and exit.")
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Provider defaults & model config (from notebook)
-# ---------------------------------------------------------------------------
-
-PROVIDER_DEFAULTS = {
-    "llama":     "qwen3.5:35b",   # just a label, actual model is the GGUF
-    "openai":    "gpt-4o",
-    "anthropic": "claude-sonnet-4-6",
-}
-
-# Models that use the Responses API (supports verbosity, reasoning)
-RESPONSES_API_MODELS = {"gpt-5", "gpt-5.4"}
-
-MODEL_DEFAULTS = {
-    "gpt-4o":       {"temperature": 1.0},
-    "gpt-4-turbo":  {"temperature": 1.0},
-    "gpt-4":        {"temperature": 1.0},
-    "gpt-5":        {"temperature": 1.0},
-    "gpt-5.4":      {"temperature": 1.0, "reasoning_effort": "medium", "verbosity": "low"},
-}
-
-
-def _resolve_model_config(model_name, extra_config=None):
-    """Apply model-specific defaults then override with any extra_config."""
-    config = {"model": model_name}
-    if model_name in MODEL_DEFAULTS:
-        config.update(MODEL_DEFAULTS[model_name])
-    if extra_config:
-        config.update(extra_config)
-    return config
-
-
-def _use_responses_api(model_name):
-    return model_name in RESPONSES_API_MODELS
-
-
-# ---------------------------------------------------------------------------
-# llama-server management
-# ---------------------------------------------------------------------------
-
-def find_free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def start_llama_server(llama_bin, gguf_path, port):
-    """Start llama-server as a background process. Returns the process."""
-    env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = "/public/gcc/12_2_0/lib64:" + env.get("LD_LIBRARY_PATH", "")
-
-    cmd = [
-        llama_bin,
-        "-m", gguf_path,
-        "--port", str(port),
-        "-ngl", "99",
-        "--ctx-size", "24576",
-        "--no-mmap",
-        "-np", "1",
-        # Note: --reasoning-format none would disable thinking but requires a newer build.
-        # Instead, <think>...</think> blocks are stripped from responses in call_llama().
-    ]
-    print(f"[llama-server] Starting on port {port}: {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
-    return proc
-
-
-def is_llama_server_healthy(port):
-    """Check if llama-server is still responding."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen(f"http://localhost:{port}/health", timeout=5) as r:
-            data = json.loads(r.read())
-            return data.get("status") == "ok"
-    except Exception:
-        return False
-
-
-def wait_for_llama_server(port, timeout=300):
-    """Poll until llama-server is ready and can generate tokens."""
-    import urllib.request
-    url = f"http://localhost:{port}/health"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as r:
-                data = json.loads(r.read())
-                if data.get("status") == "ok":
-                    print(f"[llama-server] Health check passed on port {port}, waiting for model load...")
-                    # Health check passes before weights are fully loaded into GPU —
-                    # wait an extra 30s to be safe
-                    time.sleep(30)
-                    print(f"[llama-server] Ready on port {port}")
-                    return True
-        except Exception:
-            pass
-        time.sleep(3)
-    raise TimeoutError(f"llama-server did not start within {timeout}s")
-
-
-def restart_llama_server(llama_bin, gguf_path, port, old_proc=None):
-    """Terminate old server and start a fresh one."""
-    if old_proc is not None:
-        print("[llama-server] Restarting...")
-        old_proc.terminate()
-        try:
-            old_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            old_proc.kill()
-    proc = start_llama_server(llama_bin, gguf_path, port)
-    wait_for_llama_server(port)
-    print("[llama-server] Warmup after restart...")
-    try:
-        call_llama("You are helpful.", "Say OK.", port, max_tokens=512)
-    except Exception:
-        pass
-    return proc
-
-
-# ---------------------------------------------------------------------------
-# LLM call wrappers
-# ---------------------------------------------------------------------------
-
-def call_llama(system_prompt, user_prompt, port, max_tokens=4096, retries=3):
-    """Call local llama-server via OpenAI-compatible API."""
-    from openai import OpenAI
-    client = OpenAI(
-        base_url=f"http://localhost:{port}/v1",
-        api_key="not-needed",
-    )
-    # Qwen3.5 puts extended thinking in content as <think>...</think>.
-    # These are stripped after each response; only the JSON answer is kept.
-    for attempt in range(retries):
-        response = client.chat.completions.create(
-            model="",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=max_tokens,
-        )
-        text = response.choices[0].message.content or ""
-        # This build puts thinking in content as <think>...</think>.
-        # Strip it and keep only what comes after.
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        if text and text.strip():
-            return text, response
-        print(f"  [llama] Empty response on attempt {attempt + 1}/{retries}, retrying...")
-        time.sleep(5)
-    raise ValueError(f"llama-server returned empty response after {retries} attempts")
-
-
-def call_openai(system_prompt, user_prompt, model_name, max_tokens=4096,
-                reasoning_effort=None, verbosity=None, temperature=None):
-    from openai import OpenAI
-    client = OpenAI()
-
-    if _use_responses_api(model_name):
-        # Responses API — supports verbosity and reasoning_effort (gpt-5, gpt-5.4)
-        api_params = {
-            "model": model_name,
-            "input": user_prompt,
-            "instructions": system_prompt,
-            "max_completion_tokens": max_tokens,
-            "store": True,
-        }
-        if verbosity:
-            api_params["text"] = {"verbosity": verbosity}
-        if reasoning_effort:
-            api_params["reasoning"] = {"effort": reasoning_effort}
-        response = client.responses.create(**api_params)
-        return response.output_text, response
-
-    else:
-        # Chat Completions API — standard models
-        api_params = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": max_tokens,
-        }
-        # o1-style models don't support temperature
-        if temperature is not None and "o1" not in model_name.lower():
-            api_params["temperature"] = temperature
-        if reasoning_effort and "o1" in model_name.lower():
-            api_params["reasoning_effort"] = reasoning_effort
-        response = client.chat.completions.create(**api_params)
-        return response.choices[0].message.content, response
-
-
-def call_anthropic(system_prompt, user_prompt, model_name, max_tokens=4096,
-                   thinking_budget=None):
-    from anthropic import Anthropic
-    client = Anthropic()
-    api_params = {
-        "model": model_name,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }
-    if thinking_budget:
-        api_params["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-    response = client.messages.create(**api_params)
-    text = "".join(b.text for b in response.content if hasattr(b, "text"))
-    return text, response
-
-
-def call_llm(system_prompt, user_prompt, provider, model_name, max_tokens,
-             llama_port=None, thinking_budget=None, reasoning_effort=None,
-             verbosity=None, temperature=None):
-    if provider == "llama":
-        return call_llama(system_prompt, user_prompt, llama_port, max_tokens)
-    elif provider == "openai":
-        return call_openai(system_prompt, user_prompt, model_name, max_tokens,
-                           reasoning_effort=reasoning_effort, verbosity=verbosity,
-                           temperature=temperature)
-    elif provider == "anthropic":
-        return call_anthropic(system_prompt, user_prompt, model_name, max_tokens,
-                              thinking_budget=thinking_budget)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
 
 # ---------------------------------------------------------------------------
 # Prompts (copied from notebook)
@@ -634,139 +408,6 @@ def calculate_circuit_connectivity(dn_type, n_steps, add_function=True, side="le
         difference_dnk,
     )
 
-# ---------------------------------------------------------------------------
-# JSON parsing
-# ---------------------------------------------------------------------------
-
-def _try_parse(text):
-    """Attempt json.loads, return parsed dict or raise."""
-    return json.loads(text)
-
-
-def _strip_markdown_fences(text):
-    """Remove ```json ... ``` or ``` ... ``` wrappers."""
-    # Remove all ```json and ``` markers, then strip whitespace
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```\s*', '', text)
-    return text.strip()
-
-
-def _merge_json_blocks(text):
-    """
-    If the model output multiple separate JSON objects (e.g. one per field),
-    merge them into a single dict.
-    """
-    blocks = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}', text, re.DOTALL)
-    # Also try finding top-level {...} blocks with nested braces
-    # Use a brace-counting approach for robustness
-    merged = {}
-    depth = 0
-    start = None
-    candidates = []
-    for i, ch in enumerate(text):
-        if ch == '{':
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0 and start is not None:
-                candidates.append(text[start:i+1])
-                start = None
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                merged.update(parsed)
-        except json.JSONDecodeError:
-            pass
-    return merged if merged else None
-
-
-def _fix_common_syntax_errors(text):
-    """
-    Fix common model-generated JSON syntax errors:
-    - Trailing commas before } or ]
-    - Missing comma between adjacent string/value pairs
-    - Stray * characters in keys
-    - Single-quoted strings (limited)
-    """
-    # Strip markdown fences first
-    text = _strip_markdown_fences(text)
-    # Remove stray * characters that appear at start of keys
-    text = re.sub(r'\*(\w)', r'\1', text)
-    # Remove trailing commas before closing braces/brackets
-    text = re.sub(r',\s*([\}\]])', r'\1', text)
-    # Truncated strings at end — if JSON is cut off, truncate cleanly
-    # (handled separately by truncation recovery)
-    return text
-
-
-def _recover_truncated_json(text):
-    """
-    If the JSON was cut off (max_tokens), try to recover the fields
-    that were successfully parsed before truncation.
-    Extract all complete "key": value pairs at the top level.
-    """
-    result = {}
-    # Match complete string-valued fields
-    for m in re.finditer(r'"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"', text):
-        result[m.group(1)] = m.group(2)
-    # Match complete non-string fields (numbers, booleans, null)
-    for m in re.finditer(r'"(\w+)"\s*:\s*(true|false|null|-?\d+\.?\d*)', text):
-        v = m.group(2)
-        if v == 'true': v = True
-        elif v == 'false': v = False
-        elif v == 'null': v = None
-        else:
-            try: v = float(v) if '.' in v else int(v)
-            except ValueError: pass
-        result[m.group(1)] = v
-    return result if result else None
-
-
-def parse_llm_response(text):
-    """
-    Multi-strategy JSON parser handling:
-    1. Clean JSON
-    2. Markdown-fenced JSON
-    3. Multiple JSON blocks (merge them)
-    4. Common syntax errors (trailing commas, stray *)
-    5. Truncated JSON (recover partial fields)
-    """
-    if not text or not text.strip():
-        return {"error": "Empty response"}
-
-    strategies = [
-        # 1. Direct parse
-        lambda t: _try_parse(t),
-        # 2. Strip markdown fences
-        lambda t: _try_parse(_strip_markdown_fences(t)),
-        # 3. Fix common syntax errors then parse
-        lambda t: _try_parse(_fix_common_syntax_errors(t)),
-        # 4. Merge multiple JSON blocks
-        lambda t: _merge_json_blocks(t),
-        # 5. Find first top-level {...} and fix/parse it
-        lambda t: _try_parse(_fix_common_syntax_errors(
-            re.search(r'\{.*\}', t, re.DOTALL).group()
-        )) if re.search(r'\{.*\}', t, re.DOTALL) else None,
-    ]
-
-    for strategy in strategies:
-        try:
-            result = strategy(text)
-            if result and isinstance(result, dict) and len(result) > 0:
-                return result
-        except Exception:
-            continue
-
-    # Last resort: recover whatever key-value pairs we can from truncated output
-    partial = _recover_truncated_json(text)
-    if partial:
-        partial["error"] = "truncated_response_partial_recovery"
-        return partial
-
-    return {"error": "JSON parse failed", "raw_response": text}
 
 REQUIRED_KEYS = {
     "intermediate_computations", "circuit_logic", "inferred_computation",
@@ -774,31 +415,12 @@ REQUIRED_KEYS = {
     "key_supporting_connections",
 }
 
-def validate_response(parsed: dict) -> tuple[bool, str]:
-    """Check parsed dict has exactly the required keys. Returns (ok, reason)."""
-    if "error" in parsed and "inferred_computation" not in parsed:
-        return False, f"parse error: {parsed.get('error')}"
-    missing = REQUIRED_KEYS - parsed.keys()
-    extra = parsed.keys() - REQUIRED_KEYS - {"cell_type", "model", "provider", "add_function", "chunk_id"}
-    if missing:
-        return False, f"missing keys: {missing}"
-    if extra:
-        return False, f"extra keys present: {extra}"
-    return True, ""
-
-# ---------------------------------------------------------------------------
-# Per-cell processing
-# ---------------------------------------------------------------------------
-MAX_RETRIES = 3
-
-def process_cell(cell_type, args, llama_port=None):
-    # Circuit computation
+def build_prompts_for_cell(cell_type, args):
+    """Pure: returns (system, user) for one cell type. No LLM call."""
     (difference_sensdn, intermediate_dn, difference_kunk,
      difference_kdn, difference_dnk) = calculate_circuit_connectivity(
         cell_type, args.n_steps, add_function=args.add_function, side=args.side
     )
-
-    # Format data
     fmt = format_circuit_data(
         cell_type=cell_type,
         intermediate_to_cell=intermediate_dn,
@@ -810,62 +432,20 @@ def process_cell(cell_type, args, llama_port=None):
         side=args.side,
         add_function=args.add_function,
     )
-
     user_prompt = USER_PROMPT_TEMPLATE.format(**fmt)
+    return SYSTEM_PROMPT, user_prompt
 
-    # Resolve model config (applies model-specific defaults like reasoning_effort for gpt-5.4)
-    config = _resolve_model_config(args.model)
-    reasoning_effort = config.get("reasoning_effort", args.reasoning_effort)
-    verbosity = config.get("verbosity", args.verbosity)
-    temperature = config.get("temperature", None)
+def load_data(base_path, known_types_csv):
+    """Load connectome data and set module globals.
 
-    last_result = None
-    for attempt in range(MAX_RETRIES):
-        response_text, _ = call_llm(
-            SYSTEM_PROMPT, user_prompt,
-            provider=args.provider,
-            model_name=args.model,
-            max_tokens=args.max_tokens,
-            llama_port=llama_port,
-            thinking_budget=args.thinking_budget,
-            reasoning_effort=reasoning_effort,
-            verbosity=verbosity,
-            temperature=temperature,
-        )
-        result = parse_llm_response(response_text)
-        ok, reason = validate_response(result)
-        if ok:
-            break
-        print(f"  [retry {attempt+1}/{MAX_RETRIES}] {cell_type}: {reason}")
-        last_result = result
-    else:
-        # All retries failed — keep whatever was parsed but flag it
-        result = last_result or result
-        result["validation_error"] = reason
-
-    # Strip any extra keys before saving
-    cleaned = {k: result[k] for k in REQUIRED_KEYS if k in result}
-    cleaned["cell_type"] = cell_type
-    cleaned["model"] = args.model
-    cleaned["provider"] = args.provider
-    cleaned["add_function"] = args.add_function
-    cleaned["chunk_id"] = args.chunk_id
-    if "validation_error" in result:
-        cleaned["validation_error"] = result["validation_error"]
-    return cleaned
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    args = parse_args()
-
-    # Load env + set model default
-    dotenv.load_dotenv()
-    if args.model is None:
-        args.model = PROVIDER_DEFAULTS[args.provider]
+    Called both by main() (HPC path) and by Colab notebooks. Sets globals
+    in this module so calculate_circuit_connectivity and format_circuit_data
+    can use them.
+    """
+    global inprop, meta, cell_type_to_function, type_to_sign, idx_to_type
+    global cell_type_to_random_name, idx_to_type_side, type_side_to_sign
+    global cell_type_side_to_random_name, type_side_to_side_function
+    global side_function_to_type, side_random_name_to_type
 
     # ---- Load data ----
     print("Loading connectome data...")
@@ -915,6 +495,20 @@ def main():
     meta['side_random_name'] = meta.cell_type.map(cell_type_to_random_name) + "_" + meta.side
     cell_type_side_to_random_name = dict(zip(meta.cell_type + "_" + meta.side, meta.side_random_name))
     side_random_name_to_type = dict(zip(meta.side_random_name, meta.cell_type))
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+
+    # Load env + set model default
+    dotenv.load_dotenv()
+    if args.model is None:
+        args.model = PROVIDER_DEFAULTS[args.provider]
+
+    load_data(args.base_path, args.known_types_csv)
     
     # ---- Build dns list ----
     known_types = set(
@@ -950,6 +544,25 @@ def main():
         print(f"Resuming: {len(done)} cells already done, skipping.")
     chunk = [c for c in chunk if c not in done]
 
+    if args.dump_prompts:
+        from llm_core import write_prompt_file, safe_filename
+        out_dir = Path(args.dump_prompts)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for cell_type in chunk:
+            if not ((meta.cell_type == cell_type) & (meta.side == args.side)).any():
+                print(f"  [skip] {cell_type} not on side {args.side}")
+                continue
+            try:
+                system_prompt, user_prompt = build_prompts_for_cell(cell_type, args)
+            except Exception as e:
+                print(f"  [skip] {cell_type}: {e}")
+                continue
+            out_path = out_dir / f"{safe_filename(cell_type)}.md"
+            write_prompt_file(out_path, cell_type, system_prompt, user_prompt,
+                            required_keys=REQUIRED_KEYS)
+        print(f"Dumped prompts to {out_dir}. Exiting (no LLM calls).")
+        return
+
     if not chunk:
         print("All cells in this chunk already processed. Exiting.")
         return
@@ -958,30 +571,7 @@ def main():
     llama_proc = None
     llama_port = None
     if args.provider == "llama":
-        llama_port = args.llama_port or find_free_port()
-        llama_proc = start_llama_server(args.llama_bin, args.gguf, llama_port)
-        try:
-            wait_for_llama_server(llama_port)
-        except TimeoutError as e:
-            print(f"ERROR: {e}")
-            llama_proc.terminate()
-            raise
-        # Warmup: poll until the model actually generates tokens
-        print("[llama-server] Warming up model...")
-        warmup_deadline = time.time() + 120
-        warmed = False
-        while time.time() < warmup_deadline:
-            try:
-                call_llama("You are helpful.", "Say OK.", llama_port, max_tokens=512)
-                print("[llama-server] Warmup complete.")
-                warmed = True
-                break
-            except Exception as e:
-                print(f"[llama-server] Warmup attempt failed ({e}), retrying in 10s...")
-                time.sleep(10)
-        if not warmed:
-            llama_proc.terminate()
-            raise RuntimeError("llama-server failed to generate tokens after 120s warmup")
+        llama_proc, llama_port = setup_llama_server(args)
 
     # ---- Process cells ----
     try:
@@ -999,8 +589,21 @@ def main():
                             args.llama_bin, args.gguf, llama_port, llama_proc
                         )
                 try:
-                    result = process_cell(cell_type, args, llama_port=llama_port)
-                    f.write(json.dumps(result) + "\n")
+                    system_prompt, user_prompt = build_prompts_for_cell(cell_type, args)
+                    result = call_llm_with_retry(
+                        system_prompt, user_prompt, REQUIRED_KEYS, args,
+                        llama_port=llama_port,
+                        extra_meta_keys={"cell_type", "add_function"},
+                    )
+                    cleaned = {k: result[k] for k in REQUIRED_KEYS if k in result}
+                    cleaned["cell_type"] = cell_type
+                    cleaned["model"] = args.model
+                    cleaned["provider"] = args.provider
+                    cleaned["add_function"] = args.add_function
+                    cleaned["chunk_id"] = args.chunk_id
+                    if "validation_error" in result:
+                        cleaned["validation_error"] = result["validation_error"]
+                    f.write(json.dumps(cleaned) + "\n")
                     f.flush()
                 except Exception as e:
                     print(f"  ERROR processing {cell_type}: {e}")

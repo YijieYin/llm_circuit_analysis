@@ -34,9 +34,6 @@ Example SLURM array job:
 import argparse
 import json
 import os
-import re
-import socket
-import subprocess
 import time
 import traceback
 from pathlib import Path
@@ -44,6 +41,12 @@ from pathlib import Path
 import dotenv
 import pandas as pd
 from tqdm import tqdm
+
+from llm_core import (
+    PROVIDER_DEFAULTS, resolve_model_config,
+    call_llm, parse_llm_response,
+    setup_llama_server, restart_llama_server, is_llama_server_healthy,
+)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -105,237 +108,10 @@ def parse_args():
                    help="Skip already-processed papers (--no-resume to disable)")
     p.add_argument("--delay", type=float, default=0.5,
                    help="Delay (seconds) between API calls for rate limiting")
+    p.add_argument("--dump-prompts", type=str, default=None,
+               help="Instead of calling the LLM, write one .md prompt file per "
+                    "paper to this directory and exit (full-text mode only).")
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Provider defaults & model config
-# ---------------------------------------------------------------------------
-
-PROVIDER_DEFAULTS = {
-    "llama":     "qwen3.5:35b",   # label only; actual model is the GGUF
-    "openai":    "gpt-4o",
-    "anthropic": "claude-sonnet-4-6",
-}
-
-RESPONSES_API_MODELS = {"gpt-5", "gpt-5.4"}
-
-MODEL_DEFAULTS = {
-    "gpt-4o":      {"temperature": 1.0},
-    "gpt-4-turbo": {"temperature": 1.0},
-    "gpt-4":       {"temperature": 1.0},
-    "gpt-5":       {"temperature": 1.0},
-    "gpt-5.4":     {"temperature": 1.0, "reasoning_effort": "medium", "verbosity": "low"},
-}
-
-
-def _resolve_model_config(model_name, extra_config=None):
-    """Apply model-specific defaults then override with any extra_config."""
-    config = {"model": model_name}
-    if model_name in MODEL_DEFAULTS:
-        config.update(MODEL_DEFAULTS[model_name])
-    if extra_config:
-        config.update(extra_config)
-    return config
-
-
-def _use_responses_api(model_name):
-    return model_name in RESPONSES_API_MODELS
-
-
-# ---------------------------------------------------------------------------
-# llama-server management
-# ---------------------------------------------------------------------------
-
-def find_free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def start_llama_server(llama_bin, gguf_path, port, ctx_size=65536):
-    """Start llama-server as a background process. Returns the process."""
-    env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = "/public/gcc/12_2_0/lib64:" + env.get("LD_LIBRARY_PATH", "")
-
-    cmd = [
-        llama_bin,
-        "-m", gguf_path,
-        "--port", str(port),
-        "-ngl", "99",
-        "--ctx-size", str(ctx_size),
-        "--no-mmap",
-        "-np", "1",
-    ]
-    print(f"[llama-server] Starting on port {port}: {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
-    return proc
-
-
-def is_llama_server_healthy(port):
-    """Check if llama-server is still responding."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen(f"http://localhost:{port}/health", timeout=5) as r:
-            data = json.loads(r.read())
-            return data.get("status") == "ok"
-    except Exception:
-        return False
-
-
-def wait_for_llama_server(port, timeout=300):
-    """Poll until llama-server is ready."""
-    import urllib.request
-    url = f"http://localhost:{port}/health"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as r:
-                data = json.loads(r.read())
-                if data.get("status") == "ok":
-                    print(f"[llama-server] Health check passed on port {port}, waiting for model load...")
-                    time.sleep(30)
-                    print(f"[llama-server] Ready on port {port}")
-                    return True
-        except Exception:
-            pass
-        time.sleep(3)
-    raise TimeoutError(f"llama-server did not start within {timeout}s")
-
-
-def restart_llama_server(llama_bin, gguf_path, port, old_proc=None, ctx_size=65536):
-    """Terminate old server and start a fresh one."""
-    if old_proc is not None:
-        print("[llama-server] Restarting...")
-        old_proc.terminate()
-        try:
-            old_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            old_proc.kill()
-    proc = start_llama_server(llama_bin, gguf_path, port, ctx_size=ctx_size)
-    wait_for_llama_server(port)
-    print("[llama-server] Warmup after restart...")
-    try:
-        call_llama("You are helpful.", "Say OK.", port, max_tokens=512)
-    except Exception:
-        pass
-    return proc
-
-
-# ---------------------------------------------------------------------------
-# LLM call wrappers
-# ---------------------------------------------------------------------------
-
-def call_llama(system_prompt, user_prompt, port, max_tokens=8000, think=False, retries=3):
-    """
-    Call local llama-server via OpenAI-compatible API.
-
-    think=False (default): prepend /no_think to suppress Qwen3 reasoning and
-        strip any <think>...</think> blocks that slip through anyway.
-    think=True: prepend /think to enable reasoning; the model emits a
-        <think>...</think> block then the final answer. Both are returned
-        so the caller can log or inspect the reasoning if desired.
-    """
-    from openai import OpenAI
-    client = OpenAI(base_url=f"http://localhost:{port}/v1", api_key="not-needed")
-
-    # Qwen3 soft-switches: /think and /no_think in the user turn control reasoning mode.
-    # Prepend to user_prompt rather than system_prompt — the model checks the user turn.
-    prefix = "/think\n" if think else "/no_think\n"
-    user_prompt_prefixed = prefix + user_prompt
-
-    for attempt in range(retries):
-        response = client.chat.completions.create(
-            model="",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt_prefixed},
-            ],
-            max_tokens=max_tokens,
-        )
-        text = response.choices[0].message.content or ""
-        if not think:
-            # Strip any <think>...</think> that slipped through despite /no_think
-            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        if text:
-            return text, response
-        print(f"  [llama] Empty response on attempt {attempt + 1}/{retries}, retrying...")
-        time.sleep(5)
-    raise ValueError(f"llama-server returned empty response after {retries} attempts")
-
-
-def call_openai(system_prompt, user_prompt, model_name, max_tokens=8000,
-                reasoning_effort=None, verbosity=None, temperature=None):
-    from openai import OpenAI
-    client = OpenAI()
-
-    if _use_responses_api(model_name):
-        api_params = {
-            "model": model_name,
-            "input": user_prompt,
-            "instructions": system_prompt,
-            "max_completion_tokens": max_tokens,
-            "store": True,
-        }
-        if verbosity:
-            api_params["text"] = {"verbosity": verbosity}
-        if reasoning_effort:
-            api_params["reasoning"] = {"effort": reasoning_effort}
-        response = client.responses.create(**api_params)
-        return response.output_text, response
-    else:
-        api_params = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            "max_tokens": max_tokens,
-        }
-        if temperature is not None and "o1" not in model_name.lower():
-            api_params["temperature"] = temperature
-        if reasoning_effort and "o1" in model_name.lower():
-            api_params["reasoning_effort"] = reasoning_effort
-        response = client.chat.completions.create(**api_params)
-        return response.choices[0].message.content, response
-
-
-def call_anthropic(system_prompt, user_prompt, model_name, max_tokens=8000,
-                   thinking_budget=None):
-    from anthropic import Anthropic
-    client = Anthropic()
-    api_params = {
-        "model": model_name,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }
-    if thinking_budget:
-        api_params["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-    response = client.messages.create(**api_params)
-    text = "".join(b.text for b in response.content if hasattr(b, "text"))
-    return text, response
-
-
-def call_llm(system_prompt, user_prompt, provider, model_name, max_tokens,
-             llama_port=None, think=False, thinking_budget=None, reasoning_effort=None,
-             verbosity=None, temperature=None):
-    if provider == "llama":
-        return call_llama(system_prompt, user_prompt, llama_port, max_tokens, think=think)
-    elif provider == "openai":
-        return call_openai(system_prompt, user_prompt, model_name, max_tokens,
-                           reasoning_effort=reasoning_effort, verbosity=verbosity,
-                           temperature=temperature)
-    elif provider == "anthropic":
-        return call_anthropic(system_prompt, user_prompt, model_name, max_tokens,
-                              thinking_budget=thinking_budget)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
 
 
 # ---------------------------------------------------------------------------
@@ -451,109 +227,6 @@ Return JSON format:
 
 If no experimental data found: return empty object {}
 """
-
-
-# ---------------------------------------------------------------------------
-# JSON parsing (robust multi-strategy, from neuron_interpretation.py)
-# ---------------------------------------------------------------------------
-
-def _try_parse(text):
-    return json.loads(text)
-
-
-def _strip_markdown_fences(text):
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```\s*', '', text)
-    return text.strip()
-
-
-def _fix_common_syntax_errors(text):
-    text = _strip_markdown_fences(text)
-    text = re.sub(r'\*(\w)', r'\1', text)
-    text = re.sub(r',\s*([\}\]])', r'\1', text)
-    return text
-
-
-def _merge_json_blocks(text):
-    """Merge multiple top-level JSON objects if the model split its output."""
-    merged = {}
-    depth, start = 0, None
-    candidates = []
-    for i, ch in enumerate(text):
-        if ch == '{':
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0 and start is not None:
-                candidates.append(text[start:i + 1])
-                start = None
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                merged.update(parsed)
-        except json.JSONDecodeError:
-            pass
-    return merged if merged else None
-
-
-def _recover_truncated_json(text):
-    """Extract whatever complete key-value pairs survived truncation."""
-    result = {}
-    for m in re.finditer(r'"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"', text):
-        result[m.group(1)] = m.group(2)
-    for m in re.finditer(r'"(\w+)"\s*:\s*(true|false|null|-?\d+\.?\d*)', text):
-        v = m.group(2)
-        if v == 'true':     v = True
-        elif v == 'false':  v = False
-        elif v == 'null':   v = None
-        else:
-            try: v = float(v) if '.' in v else int(v)
-            except ValueError: pass
-        result[m.group(1)] = v
-    return result if result else None
-
-
-def parse_llm_response(text):
-    """
-    Multi-strategy JSON parser:
-    1. Direct parse
-    2. Strip markdown fences
-    3. Fix common syntax errors
-    4. Merge multiple JSON blocks
-    5. Regex match first {...}
-    6. Recover from truncation
-    """
-    if not text or not text.strip():
-        return {"error": "Empty response"}
-
-    strategies = [
-        lambda t: _try_parse(t),
-        lambda t: _try_parse(_strip_markdown_fences(t)),
-        lambda t: _try_parse(_fix_common_syntax_errors(t)),
-        lambda t: _merge_json_blocks(t),
-        lambda t: _try_parse(_fix_common_syntax_errors(
-            re.search(r'\{.*\}', t, re.DOTALL).group()
-        )) if re.search(r'\{.*\}', t, re.DOTALL) else None,
-    ]
-
-    for strategy in strategies:
-        try:
-            result = strategy(text)
-            if result and isinstance(result, dict) and len(result) > 0:
-                return result
-        except Exception:
-            continue
-
-    partial = _recover_truncated_json(text)
-    if partial:
-        partial["error"] = "truncated_response_partial_recovery"
-        return partial
-
-    return {"error": "JSON parse failed", "raw_response": text}
-
 
 # ---------------------------------------------------------------------------
 # PDF loading
@@ -713,6 +386,24 @@ def format_extraction_results(result_json: dict, paper_info: dict,
         extracted.append(entry)
     return extracted
 
+def build_prompts_for_paper(paper_info, args):
+    """Pure: returns (system, user) for one paper. Uses full-text mode
+    (RAG is incompatible with prompt dumping since it requires an LLM call
+    for embeddings)."""
+    pdf_path = paper_info.get("path", "")
+    if not pdf_path or not Path(str(pdf_path)).exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path!r}")
+
+    if args.mode == "brief":
+        system_prompt, extraction_query = SYSTEM_PROMPT_BRIEF, EXTRACTION_QUERY_BRIEF
+    else:
+        system_prompt, extraction_query = SYSTEM_PROMPT_EXPERIMENTAL, EXTRACTION_QUERY_EXPERIMENTAL
+
+    full_text = load_pdf_text(pdf_path, max_chars=args.max_chars)
+    if not full_text.strip():
+        raise ValueError("Empty PDF text")
+    user_prompt = f"Paper content:\n\n{full_text}\n\nQuery:\n{extraction_query}"
+    return system_prompt, user_prompt
 
 def process_paper(paper_info: dict, args, llama_port=None) -> list[dict]:
     """
@@ -747,7 +438,7 @@ def process_paper(paper_info: dict, args, llama_port=None) -> list[dict]:
         user_prompt = f"Paper content:\n\n{full_text}\n\nQuery:\n{extraction_query}"
 
     # Resolve model config
-    config           = _resolve_model_config(args.model)
+    config           = resolve_model_config(args.model)
     temperature      = config.get("temperature", None)
     reasoning_effort = config.get("reasoning_effort", args.reasoning_effort)
     verbosity        = config.get("verbosity", None)
@@ -800,6 +491,23 @@ def main():
     chunk_df = papers_df.iloc[start:end].copy()
     print(f"Chunk {args.chunk_id}/{args.n_chunks}: papers {start}–{end} ({len(chunk_df)} papers)")
 
+    if args.dump_prompts:
+        from llm_core import write_prompt_file, safe_filename
+        out_dir = Path(args.dump_prompts)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for _, row in chunk_df.iterrows():
+            paper_info = row.to_dict()
+            pid = paper_info.get("paper_id") or paper_info.get("title", "paper")
+            try:
+                system_prompt, user_prompt = build_prompts_for_paper(paper_info, args)
+            except Exception as e:
+                print(f"  [skip] {pid}: {e}")
+                continue
+            out_path = out_dir / f"{safe_filename(pid)}.md"
+            write_prompt_file(out_path, pid, system_prompt, user_prompt)
+        print(f"Dumped prompts to {out_dir}. Exiting (no LLM calls).")
+        return
+
     # ---- Output setup ----
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -832,32 +540,8 @@ def main():
     llama_proc = None
     llama_port = None
     if args.provider == "llama":
-        llama_port = args.llama_port or find_free_port()
-        llama_proc = start_llama_server(args.llama_bin, args.gguf, llama_port)
-        try:
-            wait_for_llama_server(llama_port)
-        except TimeoutError as e:
-            print(f"ERROR: {e}")
-            llama_proc.terminate()
-            raise
-
-        # Warmup
-        print("[llama-server] Warming up model...")
-        warmup_deadline = time.time() + 120
-        warmed = False
-        while time.time() < warmup_deadline:
-            try:
-                call_llama("You are helpful.", "Say OK.", llama_port, max_tokens=512)
-                print("[llama-server] Warmup complete.")
-                warmed = True
-                break
-            except Exception as e:
-                print(f"[llama-server] Warmup attempt failed ({e}), retrying in 10s...")
-                time.sleep(10)
-        if not warmed:
-            llama_proc.terminate()
-            raise RuntimeError("llama-server failed to generate tokens after 120s warmup")
-
+        llama_proc, llama_port = setup_llama_server(args, ctx_size=args.ctx_size)
+        
     # ---- Process papers ----
     try:
         with open(out_file, "a") as f:
@@ -871,7 +555,7 @@ def main():
                     if not is_llama_server_healthy(llama_port):
                         print(f"  [llama-server] Unhealthy before {paper_id[:12]}..., restarting...")
                         llama_proc = restart_llama_server(
-                            args.llama_bin, args.gguf, llama_port, llama_proc
+                            args.llama_bin, args.gguf, llama_port, llama_proc, ctx_size=args.ctx_size
                         )
 
                 try:

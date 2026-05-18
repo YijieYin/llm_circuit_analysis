@@ -26,7 +26,7 @@ EXTRACT_SCRIPT="$HOME/llm_circuit_analysis/function_extraction_from_paper/functi
 
 PAPERS_CSV="$HOME/llm_circuit_analysis/function_extraction_from_paper/extraction_results/papers_with_names.csv"
 PAPERS_DIR="/cephfs2/yyin/llm_circuit_analysis/pdfs" # will be used in combination with file_name in PAPERS_CSV to locate each PDF
-GGUF="/cephfs2/yyin/huggingface/hub/qwen35_gguf/Qwen_Qwen3.5-35B-A3B-Q6_K_L.gguf"
+GGUF="/cephfs2/yyin/huggingface/hub/qwen36_gguf/allura-org_Qwen3.6-35B-A3B-Anko-Q8_0.gguf"
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 OUTPUT_DIR="$HOME/llm_circuit_analysis/function_extraction_from_paper/extraction_results/results"
 

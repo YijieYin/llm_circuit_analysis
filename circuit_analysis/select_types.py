@@ -20,11 +20,19 @@ import pandas as pd
 
 # ---- Configuration: edit these paths to match your setup ----
 KNOWN_TYPES_CSV = os.path.expanduser(
-    "../../known_types_snapshots/known_types_140326.csv"
+    "../../known_types_snapshots/known_types_140526.csv"
 )
-META_CSV = os.path.join(
-    "../../interpret_connectome/data/fafb_all_neuron/fafb_all_neuron_meta.csv"
-)
+dataset = 'maleCNS' # 'FAFB' or 'maleCNS'
+if dataset == 'FAFB':
+    META_CSV = os.path.join(
+        "../../interpret_connectome/data/fafb_all_neuron/fafb_all_neuron_meta.csv"
+    )
+elif dataset == 'maleCNS':
+    META_CSV = os.path.join(
+        "../../interpret_connectome/data/maleCNS/mcns_all_neuron_meta.csv"
+    )
+else:
+    raise ValueError(f"Unknown dataset: {dataset}")
 OUTPUT_FILE = "circuit_types.json"
 
 
@@ -32,6 +40,8 @@ def main():
     # Load data
     cell_type_to_function_df = pd.read_csv(KNOWN_TYPES_CSV)
     meta = pd.read_csv(META_CSV, index_col=0, low_memory=False)
+    if dataset == 'maleCNS':
+        meta = meta.rename(columns={"somaSide": "side", 'superclass': 'super_class'})  
 
     # ================================================================
     # EDIT BELOW: define your source and target cell types
@@ -41,7 +51,7 @@ def main():
     turning_types = cell_type_to_function_df.cell_type[
         cell_type_to_function_df.known_function.str.contains("turning", na=False)
         & cell_type_to_function_df.cell_type.isin(
-            meta.cell_type[meta.super_class == "descending"]
+            meta.cell_type[meta.super_class.str.contains("descending", na=False)]
         )
     ].values.tolist()
 
@@ -54,8 +64,8 @@ def main():
     # targets = ["DNa01", "DNa02"]
 
     # Alternative: different source/target classes
-    # sources = meta.cell_type[meta.super_class == "sensory"].unique().tolist()
-    # targets = meta.cell_type[meta.super_class == "descending"].unique().tolist()
+    # sources = meta.cell_type[meta.super_class.str.contains("sensory", na=False)].unique().tolist()
+    # targets = meta.cell_type[meta.super_class.str.contains("descending", na=False)].unique().tolist()
 
     # ================================================================
     # END EDIT

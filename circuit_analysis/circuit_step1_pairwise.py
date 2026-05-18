@@ -282,36 +282,25 @@ def _call_actor_revision(user_prompt_data, prev_result, critique, args, llama_po
 # ---------------------------------------------------------------------------
 # Processing
 # ---------------------------------------------------------------------------
-
-def process_pair(source, target, data, args, llama_port=None):
-    """Process a single (source, target) pair.
-    
-    If --actor-critic is enabled, runs an iterative review-revision loop.
-    Otherwise, actor only (no review).
-    """
+def build_prompts_for_pair(source, target, data, args):
+    """Pure: returns dict with system, user, and the auxiliary strings
+    that process_pair's actor-critic loop needs. Returns None if no paths."""
     type_to_hypothesis = data["type_to_hypothesis"]
 
-    # Find paths
     paths_df = find_paths_for_pair(
         source, target, data,
-        n_steps=args.n_steps,
-        threshold=args.threshold,
-        side=args.side,
+        n_steps=args.n_steps, threshold=args.threshold, side=args.side,
     )
-
     if paths_df is None or len(paths_df) == 0:
-        return None  # No paths — skip
+        return None
 
-    # Format paths by recipient at each layer
     paths_formatted = format_paths_by_recipient(
         paths_df, source, target, type_to_hypothesis
     )
 
-    # Compute net signed effect
     net_effect = compute_net_signed_effect(paths_df, data["type_side_to_sign"])
-    net_excit, net_inhib = None, None
+    net_excit, net_inhib = (net_effect if net_effect else (None, None))
     if net_effect:
-        net_excit, net_inhib = net_effect
         net = net_excit - net_inhib
         net_sign = "Excitatory" if net > 0 else "Inhibitory"
         net_effect_line = (
@@ -319,31 +308,49 @@ def process_pair(source, target, data, args, llama_port=None):
             f"{net_sign} (excit={net_excit:.5f}, inhib={net_inhib:.5f}, net={net:.5f})"
         )
     else:
-        net_effect_line = f"Net signed effect: could not compute"
+        net_effect_line = "Net signed effect: could not compute"
 
-    # Known functional inputs to target (top 5 for context)
-    known_to_target = format_known_to_target(
-        data, target, args.side, args.n_steps, top_n=5
-    )
-
-    # Source and target hypotheses
+    known_to_target = format_known_to_target(data, target, args.side, args.n_steps, top_n=5)
     source_hyp = type_to_hypothesis.get(source, "No hypothesis available")
     target_hyp = type_to_hypothesis.get(target, "No hypothesis available")
 
-    # Data dict for formatting prompts (reused in revision rounds)
     prompt_data = dict(
-        source=source,
-        target=target,
-        source_hypothesis=source_hyp,
-        target_hypothesis=target_hyp,
+        source=source, target=target,
+        source_hypothesis=source_hyp, target_hypothesis=target_hyp,
         paths_formatted=paths_formatted,
         net_effect_line=net_effect_line,
         known_to_target=known_to_target,
         side=args.side,
     )
+    user_prompt = USER_PROMPT_TEMPLATE.format(**prompt_data)
+
+    return {
+        "system": SYSTEM_PROMPT,
+        "user": user_prompt,
+        "prompt_data": prompt_data,    # for the actor-critic revision template
+        "paths_formatted": paths_formatted,
+        "net_effect_line": net_effect_line,
+        "net_excit": net_excit,
+        "net_inhib": net_inhib,
+    }
+    
+def process_pair(source, target, data, args, llama_port=None):
+    """Process a single (source, target) pair.
+    
+    If --actor-critic is enabled, runs an iterative review-revision loop.
+    Otherwise, actor only (no review).
+    """
+    prompts = build_prompts_for_pair(source, target, data, args)
+    if prompts is None:
+        return None
+    paths_formatted = prompts["paths_formatted"]
+    net_effect_line = prompts["net_effect_line"]
+    net_excit = prompts["net_excit"]
+    net_inhib = prompts["net_inhib"]
+    prompt_data = prompts["prompt_data"]
+    user_prompt = prompts["user"]
 
     # --- Initial actor call ---
-    user_prompt = USER_PROMPT_TEMPLATE.format(**prompt_data)
     result = call_llm_with_retry(
         SYSTEM_PROMPT, user_prompt, REQUIRED_KEYS, args, llama_port
     )
@@ -413,6 +420,8 @@ def main():
     parser.add_argument("--chunk-id", type=int, required=True)
     parser.add_argument("--n-chunks", type=int, required=True)
     parser.add_argument("--output-dir", type=str, default="./results_step1")
+    parser.add_argument("--dataset", type=str, default="FAFB", choices=["FAFB", "maleCNS"],
+                        help="Dataset to use (default: FAFB)")
 
     parser.add_argument(
         "--actor-critic", action="store_true", default=False,
@@ -431,7 +440,7 @@ def main():
 
     # Load data
     print("Loading connectome data...")
-    data = load_connectome_data(args.base_path, args.known_types_csv)
+    data = load_connectome_data(args.base_path, args.known_types_csv, args.dataset)
     data["type_to_hypothesis"] = load_hypotheses(args.hypotheses_csv)
     sources, targets = load_types_file(args.types_file)
 

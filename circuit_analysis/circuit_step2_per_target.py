@@ -251,6 +251,8 @@ def main():
     parser.add_argument("--n-chunks", type=int, required=True)
     parser.add_argument("--step1-dir", type=str, default="./results_step1")
     parser.add_argument("--output-dir", type=str, default="./results_step2")
+    parser.add_argument("--dataset", type=str, default="FAFB", choices=["FAFB", "maleCNS"],
+                        help="Dataset to use (default: FAFB)")
     parser.add_argument("--shared-intermediates", action="store_true", default=False,
                         help="Include shared intermediates analysis (neurons in pathways "
                              "from 2+ sources). Adds compute cost and prompt length.")
@@ -265,7 +267,7 @@ def main():
 
     # Load data
     print("Loading connectome data...")
-    data = load_connectome_data(args.base_path, args.known_types_csv)
+    data = load_connectome_data(args.base_path, args.known_types_csv, args.dataset)
     data["type_to_hypothesis"] = load_hypotheses(args.hypotheses_csv)
     sources, targets = load_types_file(args.types_file)
 

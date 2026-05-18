@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-circuit-analysis"
+version = "0.1.0"
+description = "LLM-assisted Drosophila connectome cell-type annotation pipeline"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+# Only llm_core is a real package right now. Other directories
+# (circuit_analysis, neuron_interpretation, etc.) are script folders, not
+# importable packages — they're invoked directly by their .sh wrappers.
+packages = ["llm_core"]

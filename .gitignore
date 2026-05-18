@@ -4,3 +4,7 @@ logs/
 __pycache__/
 *.pyc
 circuit_types.json
+results*
+*.csv
+output/
+*.egg-info/
