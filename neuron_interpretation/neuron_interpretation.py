@@ -449,11 +449,11 @@ def load_data(base_path, known_types_csv):
 
     # ---- Load data ----
     print("Loading connectome data...")
-    base_path = args.base_path
+    base_path = base_path
 
     global inprop, meta, cell_type_to_function, type_to_sign, idx_to_type, cell_type_to_random_name, idx_to_type_side, type_side_to_sign, cell_type_side_to_random_name, type_side_to_side_function, side_function_to_type, side_random_name_to_type
 
-    cell_type_to_function_df = pd.read_csv(os.path.expanduser(args.known_types_csv))
+    cell_type_to_function_df = pd.read_csv(os.path.expanduser(known_types_csv))
     cell_type_to_function = dict(
         zip(cell_type_to_function_df.cell_type, cell_type_to_function_df.known_function)
     )
